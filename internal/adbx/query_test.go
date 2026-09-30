@@ -1,0 +1,146 @@
+package adbx
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+const devicesSample = `List of devices attached
+R58M12ABCDE            device product:beyond1lte model:SM_G973F device:beyond1 transport_id:1
+0123456789ABCDEF       unauthorized transport_id:2
+192.168.1.9:5555       offline transport_id:3
+
+`
+
+func TestDevicesParsesLines(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: devicesSample}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.Devices(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("harus 3 perangkat, dapat %d: %+v", len(got), got)
+	}
+	if got[0].Serial != "R58M12ABCDE" || got[0].State != "device" || got[0].Model != "SM_G973F" {
+		t.Fatalf("baris pertama salah: %+v", got[0])
+	}
+	if got[1].State != "unauthorized" {
+		t.Fatalf("baris kedua salah: %+v", got[1])
+	}
+	if got[2].Serial != "192.168.1.9:5555" || got[2].State != "offline" {
+		t.Fatalf("baris ketiga salah: %+v", got[2])
+	}
+}
+
+const packagesSample = `package:/data/app/~~Ab==/com.foo-abc==/base.apk=com.foo versionCode:42
+package:/data/app/~~Cd==/com.bar-xyz==/base.apk=com.bar versionCode:7
+`
+
+func TestPackagesParsesNameAndVersion(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: packagesSample}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("harus 2 paket, dapat %d", len(got))
+	}
+	if got[0].Name != "com.foo" || got[0].VersionCode != 42 {
+		t.Fatalf("paket pertama salah: %+v", got[0])
+	}
+	if got[0].ApkPath != "/data/app/~~Ab==/com.foo-abc==/base.apk" {
+		t.Fatalf("path salah: %q", got[0].ApkPath)
+	}
+	if got[1].System {
+		t.Fatal("paket pihak ketiga tidak boleh ditandai sistem")
+	}
+}
+
+func TestPackagesFallsBackWhenVersionCodeUnsupported(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stderr: "Error: Unknown option: --show-versioncode", ExitCode: 1},
+		{Stdout: "package:/data/app/com.foo/base.apk=com.foo"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatalf("harus jatuh ke perintah tanpa flag: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "com.foo" {
+		t.Fatalf("hasil fallback salah: %+v", got)
+	}
+	if !strings.Contains(strings.Join(callsOf(fe), " "), "pm list packages") {
+		t.Fatal("perintah pm list packages tidak dijalankan")
+	}
+}
+
+func callsOf(fe *fakeExec) []string {
+	out := make([]string, 0, len(fe.calls))
+	for _, c := range fe.calls {
+		out = append(out, strings.Join(c, " "))
+	}
+	return out
+}
+
+const dumpsysSample = `Packages:
+  Package [com.example.app] (a1b2c3):
+    userId=10123
+    codePath=/data/app/~~Ab==/com.example.app-x==/base.apk
+    versionName=1.2.3
+    versionCode=42 minSdk=21 targetSdk=33
+    firstInstallTime=2024-01-01 10:00:00
+    lastUpdateTime=2024-02-02 11:00:00
+    dataDir=/data/user/0/com.example.app
+    requested permissions:
+      android.permission.INTERNET
+      android.permission.CAMERA
+    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]
+`
+
+func TestPackageInfoParsesDumpsys(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: dumpsysSample},
+		{Stdout: "1234\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.VersionName != "1.2.3" || got.VersionCode != 42 {
+		t.Fatalf("versi salah: %+v", got)
+	}
+	if got.DataDir != "/data/user/0/com.example.app" {
+		t.Fatalf("dataDir salah: %q", got.DataDir)
+	}
+	if len(got.Permissions) != 2 {
+		t.Fatalf("izin salah: %+v", got.Permissions)
+	}
+	if got.System {
+		t.Fatal("paket di /data/app bukan aplikasi sistem")
+	}
+	if got.SizeBytes != 1234*1024 {
+		t.Fatalf("ukuran salah: %d", got.SizeBytes)
+	}
+}
+
+func TestPackageInfoMarksSystemApp(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"codePath=/data/app/~~Ab==/com.example.app-x==/base.apk",
+		"codePath=/system/priv-app/Foo/Foo.apk", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/system/priv-app/Foo"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.System {
+		t.Fatal("paket di /system harus ditandai sistem")
+	}
+}
