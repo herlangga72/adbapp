@@ -113,6 +113,21 @@ func TestPackagesRetriesWhenFirstCallParsesEmpty(t *testing.T) {
 	}
 }
 
+func TestPackagesEmptyLegitDoesNotRetry(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: ""}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("harus 0 paket, dapat %d", len(got))
+	}
+	if calls := callsOf(fe); len(calls) != 1 {
+		t.Fatalf("daftar kosong yang wajar tidak boleh memicu panggilan ulang: %v", calls)
+	}
+}
+
 func TestPackagesSystemUsesSFlag(t *testing.T) {
 	fe := &fakeExec{results: []Result{{Stdout: packagesSample}}}
 	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))

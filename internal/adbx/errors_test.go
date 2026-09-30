@@ -134,3 +134,26 @@ func TestClassifyNewSentinelMessages(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyDoesNotBridgeLines(t *testing.T) {
+	// "not found" tanpa penanda "device" bukan device-not-found.
+	err := Classify(Result{Stderr: "package com.foo not found", ExitCode: 1})
+	if errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("tidak boleh ErrDeviceNotFound: %v", err)
+	}
+	var ce *CommandError
+	if !errors.As(err, &ce) {
+		t.Fatalf("seharusnya CommandError, dapat %T", err)
+	}
+
+	// "device ..." di satu baris tidak boleh dijembatani dengan "not found" di
+	// baris lain.
+	err = Classify(Result{
+		Stderr:   "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]",
+		Stdout:   "device status: ok\nremote object not found",
+		ExitCode: 1,
+	})
+	if !errors.Is(err, ErrInsufficientStorage) {
+		t.Fatalf("got %v, want ErrInsufficientStorage", err)
+	}
+}

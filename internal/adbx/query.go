@@ -98,15 +98,17 @@ func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 		flag = "-s"
 	}
 	out, err := r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f", "--show-versioncode")
+	retried := false
 	if err != nil {
 		// Perangkat lama belum mendukung --show-versioncode.
 		out, err = r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f")
 		if err != nil {
 			return nil, err
 		}
+		retried = true
 	}
 	pkgs := parsePackages(out, system)
-	if len(pkgs) == 0 {
+	if len(pkgs) == 0 && !retried && looksLikeUnsupportedFlag(out) {
 		// Sebagian build adb mencetak "Unknown option" ke stdout tetapi tetap
 		// keluar dengan status 0; ulangi tanpa --show-versioncode.
 		if out2, err2 := r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f"); err2 == nil {
@@ -114,6 +116,14 @@ func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 		}
 	}
 	return pkgs, nil
+}
+
+// looksLikeUnsupportedFlag mendeteksi keluaran yang menandakan flag tidak
+// dikenali, supaya daftar kosong yang wajar tidak memicu panggilan ulang.
+func looksLikeUnsupportedFlag(out string) bool {
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "unknown option") ||
+		strings.Contains(lower, "error")
 }
 
 func parsePackages(out string, system bool) []Package {
