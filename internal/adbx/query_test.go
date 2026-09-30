@@ -26,6 +26,12 @@ func TestDevicesParsesLines(t *testing.T) {
 	if got[0].Serial != "R58M12ABCDE" || got[0].State != "device" || got[0].Model != "SM_G973F" {
 		t.Fatalf("baris pertama salah: %+v", got[0])
 	}
+	if got[0].Product != "beyond1lte" || got[0].DeviceName != "beyond1" {
+		t.Fatalf("product/device baris pertama salah: %+v", got[0])
+	}
+	if got[1].Serial != "0123456789ABCDEF" {
+		t.Fatalf("serial baris kedua salah: %+v", got[1])
+	}
 	if got[1].State != "unauthorized" {
 		t.Fatalf("baris kedua salah: %+v", got[1])
 	}
@@ -77,6 +83,21 @@ func TestPackagesFallsBackWhenVersionCodeUnsupported(t *testing.T) {
 	}
 }
 
+func TestPackagesSystemUsesSFlag(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: packagesSample}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(callsOf(fe), " "), "list packages -s") {
+		t.Fatalf("flag -s tidak dipakai: %v", callsOf(fe))
+	}
+	if len(got) != 2 || !got[0].System {
+		t.Fatalf("paket sistem tidak ditandai: %+v", got)
+	}
+}
+
 func callsOf(fe *fakeExec) []string {
 	out := make([]string, 0, len(fe.calls))
 	for _, c := range fe.calls {
@@ -113,11 +134,24 @@ func TestPackageInfoParsesDumpsys(t *testing.T) {
 	if got.VersionName != "1.2.3" || got.VersionCode != 42 {
 		t.Fatalf("versi salah: %+v", got)
 	}
+	if got.ApkPath != "/data/app/~~Ab==/com.example.app-x==/base.apk" {
+		t.Fatalf("apkPath salah: %q", got.ApkPath)
+	}
+	if got.InstallTime != "2024-01-01 10:00:00" {
+		t.Fatalf("installTime salah: %q", got.InstallTime)
+	}
+	if got.UpdateTime != "2024-02-02 11:00:00" {
+		t.Fatalf("updateTime salah: %q", got.UpdateTime)
+	}
 	if got.DataDir != "/data/user/0/com.example.app" {
 		t.Fatalf("dataDir salah: %q", got.DataDir)
 	}
 	if len(got.Permissions) != 2 {
 		t.Fatalf("izin salah: %+v", got.Permissions)
+	}
+	if got.Permissions[0] != "android.permission.INTERNET" ||
+		got.Permissions[1] != "android.permission.CAMERA" {
+		t.Fatalf("nilai izin salah: %+v", got.Permissions)
 	}
 	if got.System {
 		t.Fatal("paket di /data/app bukan aplikasi sistem")
