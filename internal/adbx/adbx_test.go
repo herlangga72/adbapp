@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -113,6 +114,9 @@ func TestRunWrapsNonExitError(t *testing.T) {
 	if !strings.Contains(err.Error(), "/usr/bin/adb") {
 		t.Fatalf("error harus menyebut path adb: %v", err)
 	}
+	if !strings.Contains(err.Error(), "menjalankan ") {
+		t.Fatalf("error harus memakai pesan yang menyebut subjek: %v", err)
+	}
 	var got *fs.PathError
 	if !errors.As(err, &got) {
 		t.Fatalf("error harus membungkus PathError: %v", err)
@@ -145,6 +149,13 @@ func TestWithExecerNilKeepsDefault(t *testing.T) {
 	r := New("/usr/bin/adb", WithExecer(nil))
 	if r.exec == nil {
 		t.Fatal("exec tidak boleh nil")
+	}
+}
+
+func TestNewDefaultTimeout(t *testing.T) {
+	r := New("/usr/bin/adb")
+	if r.timeout != 15*time.Minute {
+		t.Fatalf("timeout bawaan = %v, want 15m", r.timeout)
 	}
 }
 
@@ -200,6 +211,57 @@ func TestRunConcurrentSameRunner(t *testing.T) {
 	for i := 0; i < n; i++ {
 		if !seen[fmt.Sprintf("arg-%d", i)] {
 			t.Fatalf("arg-%d hilang (cross-talk): %v", i, se.calls)
+		}
+	}
+}
+
+// TestHelperProcess bukan tes biasa: ia hanya tidur ketika dijalankan sebagai
+// proses anak oleh tes lain.
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("ADBX_HELPER_PROCESS") != "1" {
+		return
+	}
+	time.Sleep(60 * time.Second)
+	os.Exit(0)
+}
+
+func TestOSExecPropagatesCancellation(t *testing.T) {
+	t.Setenv("ADBX_HELPER_PROCESS", "1")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+	_, err := (osExec{}).Run(ctx, os.Args[0], "-test.run=TestHelperProcess")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestRunnerTimeoutFires(t *testing.T) {
+	t.Setenv("ADBX_HELPER_PROCESS", "1")
+	r := New(os.Args[0], WithTimeout(300*time.Millisecond))
+	_, err := r.Run(context.Background(), "-test.run=TestHelperProcess")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestWithSerialClonesRunner(t *testing.T) {
+	r := New("/usr/bin/adb")
+	r2 := r.WithSerial("S9")
+	if got := r.args("devices"); len(got) != 1 || got[0] != "devices" {
+		t.Fatalf("runner asal terubah: %v", got)
+	}
+	got := r2.args("devices")
+	want := []string{"-s", "S9", "devices"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
 		}
 	}
 }
