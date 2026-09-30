@@ -37,6 +37,26 @@ func TestClassifyKnownFailures(t *testing.T) {
 			wantErr: ErrDowngrade,
 		},
 		{
+			name:    "signature mismatch",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package com.foo signatures do not match previously installed version]", ExitCode: 1},
+			wantErr: ErrSignatureMismatch,
+		},
+		{
+			name:    "invalid apk",
+			res:     Result{Stderr: "Failure [INSTALL_PARSE_FAILED_NOT_APK]", ExitCode: 1},
+			wantErr: ErrInvalidApk,
+		},
+		{
+			name:    "older sdk",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_OLDER_SDK]", ExitCode: 1},
+			wantErr: ErrNeedsNewerAndroid,
+		},
+		{
+			name:    "shell permission denied",
+			res:     Result{Stderr: "shell: permission denied", ExitCode: 1},
+			wantErr: ErrShellPermission,
+		},
+		{
 			name:    "package not found",
 			res:     Result{Stderr: "Failure [DELETE_FAILED_INTERNAL_ERROR]\nFailure [not installed for 0]", ExitCode: 1},
 			wantErr: ErrPackageNotFound,
@@ -63,5 +83,54 @@ func TestClassifyUnknownFallsBackToCommandError(t *testing.T) {
 	var ce *CommandError
 	if !errors.As(err, &ce) {
 		t.Fatalf("seharusnya CommandError, dapat %T", err)
+	}
+	if got, want := err.Error(), "perintah adb gagal: sesuatu yang aneh"; got != want {
+		t.Fatalf("pesan salah: got %q, want %q", got, want)
+	}
+}
+
+func TestClassifyNewSentinelMessages(t *testing.T) {
+	cases := []struct {
+		name string
+		res  Result
+		want error
+		msg  string
+	}{
+		{
+			name: "signature mismatch",
+			res:  Result{Stderr: "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]"},
+			want: ErrSignatureMismatch,
+			msg:  "aplikasi dengan nama paket sama sudah terpasang dengan tanda tangan berbeda; copot dulu yang lama",
+		},
+		{
+			name: "invalid apk",
+			res:  Result{Stderr: "Failure [INSTALL_PARSE_FAILED_NOT_APK]"},
+			want: ErrInvalidApk,
+			msg:  "berkas APK tidak sah atau tidak ditandatangani",
+		},
+		{
+			name: "older sdk",
+			res:  Result{Stderr: "Failure [INSTALL_FAILED_OLDER_SDK]"},
+			want: ErrNeedsNewerAndroid,
+			msg:  "APK ini butuh versi Android yang lebih baru",
+		},
+		{
+			name: "shell permission",
+			res:  Result{Stderr: "Security exception: insufficient permissions"},
+			want: ErrShellPermission,
+			msg:  "perangkat menolak perintah ini (izin shell kurang)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Classify(tc.res)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			if got := err.Error(); got != tc.msg {
+				t.Fatalf("pesan salah: got %q, want %q", got, tc.msg)
+			}
+		})
 	}
 }

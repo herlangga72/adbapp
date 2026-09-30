@@ -2,6 +2,7 @@ package adbx
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -81,6 +82,35 @@ func TestPackagesFallsBackWhenVersionCodeUnsupported(t *testing.T) {
 	if !strings.Contains(strings.Join(callsOf(fe), " "), "pm list packages") {
 		t.Fatal("perintah pm list packages tidak dijalankan")
 	}
+	calls := callsOf(fe)
+	if len(calls) < 2 {
+		t.Fatalf("harus 2 panggilan: %v", calls)
+	}
+	if strings.Contains(calls[1], "--show-versioncode") {
+		t.Fatalf("panggilan kedua tidak boleh memakai --show-versioncode: %q", calls[1])
+	}
+}
+
+func TestPackagesRetriesWhenFirstCallParsesEmpty(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "Unknown option: --show-versioncode"},
+		{Stdout: packagesSample},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("harus 2 paket, dapat %d: %+v", len(got), got)
+	}
+	calls := callsOf(fe)
+	if len(calls) != 2 {
+		t.Fatalf("harus 2 panggilan: %v", calls)
+	}
+	if strings.Contains(calls[1], "--show-versioncode") {
+		t.Fatalf("panggilan kedua tidak boleh memakai --show-versioncode: %q", calls[1])
+	}
 }
 
 func TestPackagesSystemUsesSFlag(t *testing.T) {
@@ -95,6 +125,43 @@ func TestPackagesSystemUsesSFlag(t *testing.T) {
 	}
 	if len(got) != 2 || !got[0].System {
 		t.Fatalf("paket sistem tidak ditandai: %+v", got)
+	}
+}
+
+func TestParseDevicesLineTable(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want []Device
+	}{
+		{
+			name: "baris daemon * dilewati",
+			line: "* daemon not running; starting now at tcp:5037",
+			want: nil,
+		},
+		{
+			name: "no permissions dipetakan ke offline",
+			line: "????????????\tno permissions (user in plugdev group; are your udev rules wrong?)",
+			want: []Device{{Serial: "????????????", State: "offline"}},
+		},
+		{
+			name: "status tak dikenal dipetakan ke offline",
+			line: "ABC123\tfrobnicating transport_id:9",
+			want: []Device{{Serial: "ABC123", State: "offline"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseDevices(tc.line)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %+v want %+v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i].Serial != tc.want[i].Serial || got[i].State != tc.want[i].State {
+					t.Fatalf("got %+v want %+v", got, tc.want)
+				}
+			}
+		})
 	}
 }
 
@@ -158,6 +225,71 @@ func TestPackageInfoParsesDumpsys(t *testing.T) {
 	}
 	if got.SizeBytes != 1234*1024 {
 		t.Fatalf("ukuran salah: %d", got.SizeBytes)
+	}
+}
+
+func TestPackageInfoParsesNamespacedPermissions(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"      android.permission.CAMERA",
+		"      android.permission.CAMERA\n      org.example.permission.FOO\n      com.vendor.permission.BAR", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Permissions) != 4 {
+		t.Fatalf("izin salah: %+v", got.Permissions)
+	}
+	if got.Permissions[2] != "org.example.permission.FOO" ||
+		got.Permissions[3] != "com.vendor.permission.BAR" {
+		t.Fatalf("izin namespace salah: %+v", got.Permissions)
+	}
+}
+
+func TestPackageInfoGarbageReturnsNotFound(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "bukan keluaran dumpsys"}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	_, err := r.PackageInfo(context.Background(), "com.example.app")
+	if !errors.Is(err, ErrPackageNotFound) {
+		t.Fatalf("got %v, want ErrPackageNotFound", err)
+	}
+}
+
+func TestPackageInfoWithoutVersionName(t *testing.T) {
+	sample := strings.Replace(dumpsysSample, "    versionName=1.2.3\n", "", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.VersionName != "" || got.DataDir != "/data/user/0/com.example.app" {
+		t.Fatalf("hasil salah: %+v", got)
+	}
+}
+
+func TestPackageInfoMarksApexAsSystem(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"codePath=/data/app/~~Ab==/com.example.app-x==/base.apk",
+		"codePath=/apex/com.android.foo/foo.apk", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/apex/com.android.foo"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.System {
+		t.Fatal("paket di /apex harus ditandai sistem")
 	}
 }
 

@@ -59,7 +59,7 @@ func parseDevices(out string) []Device {
 		if len(fields) < 2 {
 			continue
 		}
-		d := Device{Serial: fields[0], State: fields[1]}
+		d := Device{Serial: fields[0], State: normalizeState(fields[1])}
 		for _, f := range fields[2:] {
 			k, v, ok := strings.Cut(f, ":")
 			if !ok {
@@ -79,6 +79,18 @@ func parseDevices(out string) []Device {
 	return devs
 }
 
+// normalizeState memetakan status yang tidak dikenal (misalnya baris
+// "no permissions (user in plugdev group; are your udev rules wrong?)") ke
+// "offline" supaya UI tidak menampilkan string yang kacau.
+func normalizeState(s string) string {
+	switch s {
+	case "device", "unauthorized", "offline", "bootloader", "recovery", "sideload", "rescue", "authorizing":
+		return s
+	default:
+		return "offline"
+	}
+}
+
 // Packages mengembalikan daftar aplikasi. system=true meminta aplikasi sistem.
 func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 	flag := "-3"
@@ -93,7 +105,15 @@ func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 			return nil, err
 		}
 	}
-	return parsePackages(out, system), nil
+	pkgs := parsePackages(out, system)
+	if len(pkgs) == 0 {
+		// Sebagian build adb mencetak "Unknown option" ke stdout tetapi tetap
+		// keluar dengan status 0; ulangi tanpa --show-versioncode.
+		if out2, err2 := r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f"); err2 == nil {
+			pkgs = parsePackages(out2, system)
+		}
+	}
+	return pkgs, nil
 }
 
 func parsePackages(out string, system bool) []Package {
@@ -136,6 +156,8 @@ func (r *Runner) PackageInfo(ctx context.Context, pkg string) (PackageInfo, erro
 		return PackageInfo{}, fmt.Errorf("%w: %s", ErrPackageNotFound, pkg)
 	}
 	if info.DataDir != "" {
+		// Bila `du` gagal, SizeBytes tetap 0 yang berarti "ukuran tidak
+		// diketahui".
 		if size, err := r.Output(ctx, "shell", "du", "-sk", info.DataDir); err == nil {
 			info.SizeBytes = parseDU(size)
 		}
@@ -144,20 +166,26 @@ func (r *Runner) PackageInfo(ctx context.Context, pkg string) (PackageInfo, erro
 }
 
 func parseDumpsys(pkg, out string) PackageInfo {
-	info := PackageInfo{Package: pkg}
+	info := PackageInfo{}
+	found := false
 	inPermissions := false
 	for _, raw := range strings.Split(out, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
+		if !found && strings.HasPrefix(line, "Package [") {
+			// Kehadiran paket dideteksi dari header "Package [<nama>]", bukan
+			// dari kelengkapan field versi.
+			found = true
+			info.Package = pkg
+		}
 		if line == "requested permissions:" {
 			inPermissions = true
 			continue
 		}
 		if inPermissions {
-			if strings.HasPrefix(line, "android.permission.") ||
-				strings.HasPrefix(line, "com.") {
+			if strings.Contains(line, ".permission.") {
 				info.Permissions = append(info.Permissions, line)
 				continue
 			}
@@ -186,12 +214,16 @@ func parseDumpsys(pkg, out string) PackageInfo {
 			info.DataDir = value
 		}
 	}
-	if info.VersionName == "" || info.ApkPath == "" {
+	if !found {
 		return PackageInfo{}
 	}
+	// Paket sistem biasanya berada di /system, /product, /vendor, atau /apex.
+	// Ini heuristik: aplikasi sistem yang diperbarui dapat berpindah ke
+	// /data/app sehingga tidak lagi terdeteksi sebagai sistem.
 	info.System = strings.HasPrefix(info.ApkPath, "/system") ||
 		strings.HasPrefix(info.ApkPath, "/product") ||
-		strings.HasPrefix(info.ApkPath, "/vendor")
+		strings.HasPrefix(info.ApkPath, "/vendor") ||
+		strings.HasPrefix(info.ApkPath, "/apex")
 	return info
 }
 

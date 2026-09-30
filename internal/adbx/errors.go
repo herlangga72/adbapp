@@ -13,6 +13,10 @@ var (
 	ErrDowngrade           = errors.New("versi lebih rendah dari yang terpasang")
 	ErrPackageNotFound     = errors.New("aplikasi tidak terpasang")
 	ErrSystemApp           = errors.New("aplikasi sistem tidak boleh dicopot")
+	ErrSignatureMismatch   = errors.New("aplikasi dengan nama paket sama sudah terpasang dengan tanda tangan berbeda; copot dulu yang lama")
+	ErrInvalidApk          = errors.New("berkas APK tidak sah atau tidak ditandatangani")
+	ErrNeedsNewerAndroid   = errors.New("APK ini butuh versi Android yang lebih baru")
+	ErrShellPermission     = errors.New("perangkat menolak perintah ini (izin shell kurang)")
 )
 
 // Classify menerjemahkan keluaran adb yang gagal menjadi error yang bisa
@@ -25,10 +29,21 @@ func Classify(res Result) error {
 	switch {
 	case strings.Contains(lower, "not installed for"):
 		return ErrPackageNotFound
+	case strings.Contains(lower, "update_incompatible"),
+		strings.Contains(lower, "signatures do not match"):
+		return ErrSignatureMismatch
+	case strings.Contains(lower, "parse_failed"),
+		strings.Contains(lower, "invalid_apk"):
+		return ErrInvalidApk
+	case strings.Contains(lower, "older_sdk"),
+		strings.Contains(lower, "requires newer sdk"):
+		return ErrNeedsNewerAndroid
 	case strings.Contains(lower, "device unauthorized"),
-		strings.Contains(lower, "insufficient permissions"),
 		strings.Contains(lower, "unauthorized"):
 		return ErrUnauthorized
+	case strings.Contains(lower, "insufficient permissions"),
+		strings.Contains(lower, "permission denied"):
+		return ErrShellPermission
 	case looksLikeDeviceNotFound(lower),
 		strings.Contains(lower, "device offline"),
 		strings.Contains(lower, "no devices/emulators found"):
@@ -40,6 +55,11 @@ func Classify(res Result) error {
 	case strings.Contains(lower, "version_downgrade"):
 		return ErrDowngrade
 	case strings.Contains(lower, "delete_failed"):
+		// Heuristik: DELETE_FAILED_INTERNAL_ERROR biasanya berarti paket
+		// sistem tidak boleh dicopot, tetapi kadang hanya berarti paketnya
+		// sudah tidak ada. Arm "not installed for" di atas lebih dulu,
+		// sehingga kasus paket hilang tetap terklasifikasi benar bila kedua
+		// penanda muncul bersamaan.
 		return ErrSystemApp
 	default:
 		return &CommandError{Result: res}
@@ -57,9 +77,9 @@ func (e *CommandError) Error() string {
 		msg = firstLine(e.Result.Stdout)
 	}
 	if msg == "" {
-		msg = "perintah adb gagal"
+		msg = "tanpa keluaran"
 	}
-	return msg
+	return "perintah adb gagal: " + msg
 }
 
 func firstLine(s string) string {
@@ -74,11 +94,14 @@ func firstLine(s string) string {
 // looksLikeDeviceNotFound cocok untuk pola "device not found" maupun
 // "device 'SERIAL' not found". strings.Contains(lower, "device not found")
 // tidak cukup karena adb menyisipkan nomor seri di antara "device" dan
-// "not found".
-func looksLikeDeviceNotFound(lower string) bool {
-	i := strings.Index(lower, "device")
-	if i < 0 {
-		return false
+// "not found". Pemeriksaan dilakukan per baris supaya keluaran stderr dan
+// stdout tidak saling menjembatani pola.
+func looksLikeDeviceNotFound(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		i := strings.Index(line, "device")
+		if i >= 0 && strings.Contains(line[i:], "not found") {
+			return true
+		}
 	}
-	return strings.Contains(lower[i:], "not found")
+	return false
 }
