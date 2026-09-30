@@ -1430,6 +1430,26 @@ func TestClassifyKnownFailures(t *testing.T) {
 			wantErr: ErrDowngrade,
 		},
 		{
+			name:    "signature mismatch",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package com.foo signatures do not match previously installed version]", ExitCode: 1},
+			wantErr: ErrSignatureMismatch,
+		},
+		{
+			name:    "invalid apk",
+			res:     Result{Stderr: "Failure [INSTALL_PARSE_FAILED_NOT_APK]", ExitCode: 1},
+			wantErr: ErrInvalidApk,
+		},
+		{
+			name:    "older sdk",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_OLDER_SDK]", ExitCode: 1},
+			wantErr: ErrNeedsNewerAndroid,
+		},
+		{
+			name:    "shell permission denied",
+			res:     Result{Stderr: "shell: permission denied", ExitCode: 1},
+			wantErr: ErrShellPermission,
+		},
+		{
 			name:    "package not found",
 			res:     Result{Stderr: "Failure [DELETE_FAILED_INTERNAL_ERROR]\nFailure [not installed for 0]", ExitCode: 1},
 			wantErr: ErrPackageNotFound,
@@ -1456,6 +1476,55 @@ func TestClassifyUnknownFallsBackToCommandError(t *testing.T) {
 	var ce *CommandError
 	if !errors.As(err, &ce) {
 		t.Fatalf("seharusnya CommandError, dapat %T", err)
+	}
+	if got, want := err.Error(), "perintah adb gagal: sesuatu yang aneh"; got != want {
+		t.Fatalf("pesan salah: got %q, want %q", got, want)
+	}
+}
+
+func TestClassifyNewSentinelMessages(t *testing.T) {
+	cases := []struct {
+		name string
+		res  Result
+		want error
+		msg  string
+	}{
+		{
+			name: "signature mismatch",
+			res:  Result{Stderr: "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]"},
+			want: ErrSignatureMismatch,
+			msg:  "aplikasi dengan nama paket sama sudah terpasang dengan tanda tangan berbeda; copot dulu yang lama",
+		},
+		{
+			name: "invalid apk",
+			res:  Result{Stderr: "Failure [INSTALL_PARSE_FAILED_NOT_APK]"},
+			want: ErrInvalidApk,
+			msg:  "berkas APK tidak sah atau tidak ditandatangani",
+		},
+		{
+			name: "older sdk",
+			res:  Result{Stderr: "Failure [INSTALL_FAILED_OLDER_SDK]"},
+			want: ErrNeedsNewerAndroid,
+			msg:  "APK ini butuh versi Android yang lebih baru",
+		},
+		{
+			name: "shell permission",
+			res:  Result{Stderr: "Security exception: insufficient permissions"},
+			want: ErrShellPermission,
+			msg:  "perangkat menolak perintah ini (izin shell kurang)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Classify(tc.res)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			if got := err.Error(); got != tc.msg {
+				t.Fatalf("pesan salah: got %q, want %q", got, tc.msg)
+			}
+		})
 	}
 }
 ```
@@ -1485,6 +1554,10 @@ var (
 	ErrDowngrade           = errors.New("versi lebih rendah dari yang terpasang")
 	ErrPackageNotFound     = errors.New("aplikasi tidak terpasang")
 	ErrSystemApp           = errors.New("aplikasi sistem tidak boleh dicopot")
+	ErrSignatureMismatch   = errors.New("aplikasi dengan nama paket sama sudah terpasang dengan tanda tangan berbeda; copot dulu yang lama")
+	ErrInvalidApk          = errors.New("berkas APK tidak sah atau tidak ditandatangani")
+	ErrNeedsNewerAndroid   = errors.New("APK ini butuh versi Android yang lebih baru")
+	ErrShellPermission     = errors.New("perangkat menolak perintah ini (izin shell kurang)")
 )
 
 // Classify menerjemahkan keluaran adb yang gagal menjadi error yang bisa
@@ -1497,10 +1570,21 @@ func Classify(res Result) error {
 	switch {
 	case strings.Contains(lower, "not installed for"):
 		return ErrPackageNotFound
+	case strings.Contains(lower, "update_incompatible"),
+		strings.Contains(lower, "signatures do not match"):
+		return ErrSignatureMismatch
+	case strings.Contains(lower, "parse_failed"),
+		strings.Contains(lower, "invalid_apk"):
+		return ErrInvalidApk
+	case strings.Contains(lower, "older_sdk"),
+		strings.Contains(lower, "requires newer sdk"):
+		return ErrNeedsNewerAndroid
 	case strings.Contains(lower, "device unauthorized"),
-		strings.Contains(lower, "insufficient permissions"),
 		strings.Contains(lower, "unauthorized"):
 		return ErrUnauthorized
+	case strings.Contains(lower, "insufficient permissions"),
+		strings.Contains(lower, "permission denied"):
+		return ErrShellPermission
 	case looksLikeDeviceNotFound(lower),
 		strings.Contains(lower, "device offline"),
 		strings.Contains(lower, "no devices/emulators found"):
@@ -1512,6 +1596,11 @@ func Classify(res Result) error {
 	case strings.Contains(lower, "version_downgrade"):
 		return ErrDowngrade
 	case strings.Contains(lower, "delete_failed"):
+		// Heuristik: DELETE_FAILED_INTERNAL_ERROR biasanya berarti paket
+		// sistem tidak boleh dicopot, tetapi kadang hanya berarti paketnya
+		// sudah tidak ada. Arm "not installed for" di atas lebih dulu,
+		// sehingga kasus paket hilang tetap terklasifikasi benar bila kedua
+		// penanda muncul bersamaan.
 		return ErrSystemApp
 	default:
 		return &CommandError{Result: res}
@@ -1529,9 +1618,9 @@ func (e *CommandError) Error() string {
 		msg = firstLine(e.Result.Stdout)
 	}
 	if msg == "" {
-		msg = "perintah adb gagal"
+		msg = "tanpa keluaran"
 	}
-	return msg
+	return "perintah adb gagal: " + msg
 }
 
 func firstLine(s string) string {
@@ -1546,13 +1635,16 @@ func firstLine(s string) string {
 // looksLikeDeviceNotFound cocok untuk pola "device not found" maupun
 // "device 'SERIAL' not found". strings.Contains(lower, "device not found")
 // tidak cukup karena adb menyisipkan nomor seri di antara "device" dan
-// "not found".
-func looksLikeDeviceNotFound(lower string) bool {
-	i := strings.Index(lower, "device")
-	if i < 0 {
-		return false
+// "not found". Pemeriksaan dilakukan per baris supaya keluaran stderr dan
+// stdout tidak saling menjembatani pola.
+func looksLikeDeviceNotFound(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		i := strings.Index(line, "device")
+		if i >= 0 && strings.Contains(line[i:], "not found") {
+			return true
+		}
 	}
-	return strings.Contains(lower[i:], "not found")
+	return false
 }
 ```
 
@@ -1598,6 +1690,7 @@ package adbx
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -1621,6 +1714,12 @@ func TestDevicesParsesLines(t *testing.T) {
 	}
 	if got[0].Serial != "R58M12ABCDE" || got[0].State != "device" || got[0].Model != "SM_G973F" {
 		t.Fatalf("baris pertama salah: %+v", got[0])
+	}
+	if got[0].Product != "beyond1lte" || got[0].DeviceName != "beyond1" {
+		t.Fatalf("product/device baris pertama salah: %+v", got[0])
+	}
+	if got[1].Serial != "0123456789ABCDEF" {
+		t.Fatalf("serial baris kedua salah: %+v", got[1])
 	}
 	if got[1].State != "unauthorized" {
 		t.Fatalf("baris kedua salah: %+v", got[1])
@@ -1671,6 +1770,87 @@ func TestPackagesFallsBackWhenVersionCodeUnsupported(t *testing.T) {
 	if !strings.Contains(strings.Join(callsOf(fe), " "), "pm list packages") {
 		t.Fatal("perintah pm list packages tidak dijalankan")
 	}
+	calls := callsOf(fe)
+	if len(calls) < 2 {
+		t.Fatalf("harus 2 panggilan: %v", calls)
+	}
+	if strings.Contains(calls[1], "--show-versioncode") {
+		t.Fatalf("panggilan kedua tidak boleh memakai --show-versioncode: %q", calls[1])
+	}
+}
+
+func TestPackagesRetriesWhenFirstCallParsesEmpty(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "Unknown option: --show-versioncode"},
+		{Stdout: packagesSample},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("harus 2 paket, dapat %d: %+v", len(got), got)
+	}
+	calls := callsOf(fe)
+	if len(calls) != 2 {
+		t.Fatalf("harus 2 panggilan: %v", calls)
+	}
+	if strings.Contains(calls[1], "--show-versioncode") {
+		t.Fatalf("panggilan kedua tidak boleh memakai --show-versioncode: %q", calls[1])
+	}
+}
+
+func TestPackagesSystemUsesSFlag(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: packagesSample}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(callsOf(fe), " "), "list packages -s") {
+		t.Fatalf("flag -s tidak dipakai: %v", callsOf(fe))
+	}
+	if len(got) != 2 || !got[0].System {
+		t.Fatalf("paket sistem tidak ditandai: %+v", got)
+	}
+}
+
+func TestParseDevicesLineTable(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want []Device
+	}{
+		{
+			name: "baris daemon * dilewati",
+			line: "* daemon not running; starting now at tcp:5037",
+			want: nil,
+		},
+		{
+			name: "no permissions dipetakan ke offline",
+			line: "????????????\tno permissions (user in plugdev group; are your udev rules wrong?)",
+			want: []Device{{Serial: "????????????", State: "offline"}},
+		},
+		{
+			name: "status tak dikenal dipetakan ke offline",
+			line: "ABC123\tfrobnicating transport_id:9",
+			want: []Device{{Serial: "ABC123", State: "offline"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseDevices(tc.line)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %+v want %+v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i].Serial != tc.want[i].Serial || got[i].State != tc.want[i].State {
+					t.Fatalf("got %+v want %+v", got, tc.want)
+				}
+			}
+		})
+	}
 }
 
 func callsOf(fe *fakeExec) []string {
@@ -1709,17 +1889,95 @@ func TestPackageInfoParsesDumpsys(t *testing.T) {
 	if got.VersionName != "1.2.3" || got.VersionCode != 42 {
 		t.Fatalf("versi salah: %+v", got)
 	}
+	if got.ApkPath != "/data/app/~~Ab==/com.example.app-x==/base.apk" {
+		t.Fatalf("apkPath salah: %q", got.ApkPath)
+	}
+	if got.InstallTime != "2024-01-01 10:00:00" {
+		t.Fatalf("installTime salah: %q", got.InstallTime)
+	}
+	if got.UpdateTime != "2024-02-02 11:00:00" {
+		t.Fatalf("updateTime salah: %q", got.UpdateTime)
+	}
 	if got.DataDir != "/data/user/0/com.example.app" {
 		t.Fatalf("dataDir salah: %q", got.DataDir)
 	}
 	if len(got.Permissions) != 2 {
 		t.Fatalf("izin salah: %+v", got.Permissions)
 	}
+	if got.Permissions[0] != "android.permission.INTERNET" ||
+		got.Permissions[1] != "android.permission.CAMERA" {
+		t.Fatalf("nilai izin salah: %+v", got.Permissions)
+	}
 	if got.System {
 		t.Fatal("paket di /data/app bukan aplikasi sistem")
 	}
 	if got.SizeBytes != 1234*1024 {
 		t.Fatalf("ukuran salah: %d", got.SizeBytes)
+	}
+}
+
+func TestPackageInfoParsesNamespacedPermissions(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"      android.permission.CAMERA",
+		"      android.permission.CAMERA\n      org.example.permission.FOO\n      com.vendor.permission.BAR", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Permissions) != 4 {
+		t.Fatalf("izin salah: %+v", got.Permissions)
+	}
+	if got.Permissions[2] != "org.example.permission.FOO" ||
+		got.Permissions[3] != "com.vendor.permission.BAR" {
+		t.Fatalf("izin namespace salah: %+v", got.Permissions)
+	}
+}
+
+func TestPackageInfoGarbageReturnsNotFound(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "bukan keluaran dumpsys"}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	_, err := r.PackageInfo(context.Background(), "com.example.app")
+	if !errors.Is(err, ErrPackageNotFound) {
+		t.Fatalf("got %v, want ErrPackageNotFound", err)
+	}
+}
+
+func TestPackageInfoWithoutVersionName(t *testing.T) {
+	sample := strings.Replace(dumpsysSample, "    versionName=1.2.3\n", "", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.VersionName != "" || got.DataDir != "/data/user/0/com.example.app" {
+		t.Fatalf("hasil salah: %+v", got)
+	}
+}
+
+func TestPackageInfoMarksApexAsSystem(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"codePath=/data/app/~~Ab==/com.example.app-x==/base.apk",
+		"codePath=/apex/com.android.foo/foo.apk", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/apex/com.android.foo"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.System {
+		t.Fatal("paket di /apex harus ditandai sistem")
 	}
 }
 
@@ -1813,7 +2071,7 @@ func parseDevices(out string) []Device {
 		if len(fields) < 2 {
 			continue
 		}
-		d := Device{Serial: fields[0], State: fields[1]}
+		d := Device{Serial: fields[0], State: normalizeState(fields[1])}
 		for _, f := range fields[2:] {
 			k, v, ok := strings.Cut(f, ":")
 			if !ok {
@@ -1833,6 +2091,18 @@ func parseDevices(out string) []Device {
 	return devs
 }
 
+// normalizeState memetakan status yang tidak dikenal (misalnya baris
+// "no permissions (user in plugdev group; are your udev rules wrong?)") ke
+// "offline" supaya UI tidak menampilkan string yang kacau.
+func normalizeState(s string) string {
+	switch s {
+	case "device", "unauthorized", "offline", "bootloader", "recovery", "sideload", "rescue", "authorizing":
+		return s
+	default:
+		return "offline"
+	}
+}
+
 // Packages mengembalikan daftar aplikasi. system=true meminta aplikasi sistem.
 func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 	flag := "-3"
@@ -1847,7 +2117,15 @@ func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 			return nil, err
 		}
 	}
-	return parsePackages(out, system), nil
+	pkgs := parsePackages(out, system)
+	if len(pkgs) == 0 {
+		// Sebagian build adb mencetak "Unknown option" ke stdout tetapi tetap
+		// keluar dengan status 0; ulangi tanpa --show-versioncode.
+		if out2, err2 := r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f"); err2 == nil {
+			pkgs = parsePackages(out2, system)
+		}
+	}
+	return pkgs, nil
 }
 
 func parsePackages(out string, system bool) []Package {
@@ -1890,6 +2168,8 @@ func (r *Runner) PackageInfo(ctx context.Context, pkg string) (PackageInfo, erro
 		return PackageInfo{}, fmt.Errorf("%w: %s", ErrPackageNotFound, pkg)
 	}
 	if info.DataDir != "" {
+		// Bila `du` gagal, SizeBytes tetap 0 yang berarti "ukuran tidak
+		// diketahui".
 		if size, err := r.Output(ctx, "shell", "du", "-sk", info.DataDir); err == nil {
 			info.SizeBytes = parseDU(size)
 		}
@@ -1898,20 +2178,26 @@ func (r *Runner) PackageInfo(ctx context.Context, pkg string) (PackageInfo, erro
 }
 
 func parseDumpsys(pkg, out string) PackageInfo {
-	info := PackageInfo{Package: pkg}
+	info := PackageInfo{}
+	found := false
 	inPermissions := false
 	for _, raw := range strings.Split(out, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
+		if !found && strings.HasPrefix(line, "Package [") {
+			// Kehadiran paket dideteksi dari header "Package [<nama>]", bukan
+			// dari kelengkapan field versi.
+			found = true
+			info.Package = pkg
+		}
 		if line == "requested permissions:" {
 			inPermissions = true
 			continue
 		}
 		if inPermissions {
-			if strings.HasPrefix(line, "android.permission.") ||
-				strings.HasPrefix(line, "com.") {
+			if strings.Contains(line, ".permission.") {
 				info.Permissions = append(info.Permissions, line)
 				continue
 			}
@@ -1940,12 +2226,16 @@ func parseDumpsys(pkg, out string) PackageInfo {
 			info.DataDir = value
 		}
 	}
-	if info.VersionName == "" || info.ApkPath == "" {
+	if !found {
 		return PackageInfo{}
 	}
+	// Paket sistem biasanya berada di /system, /product, /vendor, atau /apex.
+	// Ini heuristik: aplikasi sistem yang diperbarui dapat berpindah ke
+	// /data/app sehingga tidak lagi terdeteksi sebagai sistem.
 	info.System = strings.HasPrefix(info.ApkPath, "/system") ||
 		strings.HasPrefix(info.ApkPath, "/product") ||
-		strings.HasPrefix(info.ApkPath, "/vendor")
+		strings.HasPrefix(info.ApkPath, "/vendor") ||
+		strings.HasPrefix(info.ApkPath, "/apex")
 	return info
 }
 
