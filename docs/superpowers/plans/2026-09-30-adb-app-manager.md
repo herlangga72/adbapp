@@ -376,6 +376,11 @@ git commit -m "feat(paths): tentukan folder data per OS"
 - Create: `internal/bundle/bundle.go`
 - Test: `internal/bundle/bundle_test.go`
 
+Catatan: unit yang ditanam adalah direktori `bin/<goos>-<goarch>/`. Di Windows
+direktori itu berisi `adb.exe` beserta `AdbWinApi.dll` dan `AdbWinUsbApi.dll`
+yang wajib ikut terekstrak, karena `adb.exe` memuat `AdbWinApi.dll` secara
+statis.
+
 - [ ] **Step 1: Tulis tes yang gagal**
 
 Create `internal/bundle/bundle_test.go`:
@@ -387,9 +392,22 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 )
+
+func assertNoTemps(t *testing.T, dir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob gagal: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("berkas sementara tersisa: %v", matches)
+	}
+}
 
 func TestEnsureFromExtractsBinary(t *testing.T) {
 	fsys := fstest.MapFS{
@@ -447,6 +465,145 @@ func TestEnsureFromErrorsWhenPlatformMissing(t *testing.T) {
 		t.Fatal("seharusnya error saat biner platform tidak ada")
 	}
 }
+
+func TestEnsureFromReextractsWhenVersionChanges(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("baru"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "adb"), []byte("lama"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".version"), []byte("0:linux-amd64"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "adb"))
+	if string(data) != "baru" {
+		t.Fatalf("adb seharusnya diekstrak ulang saat versi berubah, isi: %q", data)
+	}
+}
+
+func TestEnsureFromReextractsWhenBinaryMissing(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi adb"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	first, err := ensureFrom(fsys, dir, "linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ensureFrom(fsys, dir, "linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(second)
+	if err != nil || len(data) == 0 {
+		t.Fatalf("adb seharusnya diekstrak ulang saat biner hilang: %v", err)
+	}
+}
+
+func TestEnsureFromReextractsWhenStampCorrupt(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("baru"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "adb"), []byte("lama"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".version"), []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "adb"))
+	if string(data) != "baru" {
+		t.Fatalf("adb seharusnya diekstrak ulang saat stempel rusak, isi: %q", data)
+	}
+}
+
+func TestEnsureFromExtractsWindowsDLLs(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/windows-amd64/adb.exe":           &fstest.MapFile{Data: []byte("exe"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinApi.dll":     &fstest.MapFile{Data: []byte("api"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinUsbApi.dll":  &fstest.MapFile{Data: []byte("usb"), Mode: 0o644},
+		"bin/windows-amd64/source.properties": &fstest.MapFile{Data: []byte("prop"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	got, err := ensureFrom(fsys, dir, "windows", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(got, "adb.exe") {
+		t.Fatalf("path adb salah: %q", got)
+	}
+	for _, n := range []string{"adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "source.properties"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Fatalf("%s tidak diekstrak: %v", n, err)
+		}
+	}
+}
+
+func TestEnsureFromLeavesNoTempAfterSuccess(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	assertNoTemps(t, dir)
+}
+
+func TestEnsureFromLeavesNoTempAfterFailure(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	// Direktori tujuan yang tidak kosong membuat operasi rename gagal.
+	if err := os.MkdirAll(filepath.Join(dir, "adb", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err == nil {
+		t.Fatal("seharusnya error saat tujuan tidak dapat ditulis")
+	}
+	assertNoTemps(t, dir)
+}
+
+func TestEnsureFromConcurrent(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb":        &fstest.MapFile{Data: []byte("#!/bin/sh\necho hi\n"), Mode: 0o644},
+		"bin/linux-amd64/NOTICE.txt": &fstest.MapFile{Data: []byte("notice"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	const n = 8
+	var wg sync.WaitGroup
+	paths := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			paths[i], errs[i] = ensureFrom(fsys, dir, "linux", "amd64")
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d gagal: %v", i, errs[i])
+		}
+		if paths[i] == "" {
+			t.Fatalf("goroutine %d mengembalikan path kosong", i)
+		}
+	}
+	assertNoTemps(t, dir)
+}
 ```
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
@@ -483,8 +640,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"time"
 )
 
 // Ensure mengekstrak adb untuk OS saat ini dan mengembalikan path-nya.
@@ -499,13 +658,32 @@ func adbName(goos string) string {
 	return "adb"
 }
 
+// ensureFrom mengekstrak seluruh isi folder bin/<goos>-<goarch>/ ke adbDir.
+// Di Windows, adb.exe memuat AdbWinApi.dll secara statis sehingga DLL tersebut
+// harus ikut diekstrak berdampingan; karena itu unit yang disalin adalah
+// direktori, bukan satu berkas.
 func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
 	name := adbName(goos)
-	src := fmt.Sprintf("bin/%s-%s/%s", goos, goarch, name)
-	if _, err := fs.Stat(fsys, src); err != nil {
-		return "", fmt.Errorf(
-			"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
-			goos, goarch)
+	srcDir := path.Join("bin", goos+"-"+goarch)
+
+	entries, err := fs.ReadDir(fsys, srcDir)
+	if err != nil {
+		return "", notBundledError(goos, goarch)
+	}
+
+	var files []string
+	hasAdb := false
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		files = append(files, e.Name())
+		if e.Name() == name {
+			hasAdb = true
+		}
+	}
+	if !hasAdb {
+		return "", notBundledError(goos, goarch)
 	}
 
 	dst := filepath.Join(adbDir, name)
@@ -513,53 +691,104 @@ func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
 	want := Version + ":" + goos + "-" + goarch
 
 	if got, err := os.ReadFile(stamp); err == nil && string(got) == want {
-		if _, err := os.Stat(dst); err == nil {
+		if st, err := os.Stat(dst); err == nil && st.Mode().IsRegular() {
 			return dst, nil
 		}
 	}
 
 	if err := os.MkdirAll(adbDir, 0o755); err != nil {
-		return "", err
+		return "", fmt.Errorf("membuat folder %s: %w", adbDir, err)
 	}
-	if err := copyFile(fsys, src, dst); err != nil {
-		return "", err
+	removeStaleTemps(adbDir)
+
+	for _, f := range files {
+		if err := copyFile(fsys, path.Join(srcDir, f), filepath.Join(adbDir, f)); err != nil {
+			return "", err
+		}
 	}
 	if err := os.WriteFile(stamp, []byte(want), 0o644); err != nil {
-		return "", err
+		return "", fmt.Errorf("menulis %s: %w", stamp, err)
 	}
 	return dst, nil
 }
 
+func notBundledError(goos, goarch string) error {
+	return fmt.Errorf(
+		"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
+		goos, goarch)
+}
+
+// removeStaleTemps membersihkan sisa berkas sementara yang sudah lama
+// tertinggal. Hanya berkas yang lebih tua dari satu jam yang dihapus supaya
+// ekstraksi paralel yang sedang berjalan tidak terganggu.
+func removeStaleTemps(dir string) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-time.Hour)
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && st.ModTime().Before(cutoff) {
+			os.Remove(m)
+		}
+	}
+}
+
 func copyFile(fsys fs.FS, src, dst string) error {
+	info, err := fs.Stat(fsys, src)
+	if err != nil {
+		return fmt.Errorf("membaca %s: %w", src, err)
+	}
 	in, err := fsys.Open(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("membuka %s: %w", src, err)
 	}
 	defer in.Close()
 
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("membuat berkas sementara untuk %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyalin %s: %w", src, err)
 	}
-	if err := out.Close(); err != nil {
-		return err
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyinkronkan %s: %w", dst, err)
 	}
-	if err := os.Chmod(tmp, 0o755); err != nil {
-		return err
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("menutup berkas sementara %s: %w", tmpName, err)
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		return fmt.Errorf("mengatur mode %s: %w", dst, err)
+	}
+
+	if err := os.Rename(tmpName, dst); err != nil {
+		if rmErr := os.Remove(dst); rmErr == nil {
+			if err := os.Rename(tmpName, dst); err == nil {
+				return nil
+			}
+		}
+		if st, statErr := os.Stat(dst); statErr == nil && st.Mode().IsRegular() && st.Size() == info.Size() {
+			// Berkas tujuan sudah ditulis oleh ekstraksi lain yang berjalan
+			// bersamaan; isinya identik, jadi anggap berhasil.
+			return nil
+		}
+		return fmt.Errorf("memindahkan %s ke %s: %w", tmpName, dst, err)
+	}
+	return nil
 }
 ```
 
 - [ ] **Step 4: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/bundle/ -v`
-Expected: PASS untuk ketiga tes.
+Expected: PASS untuk seluruh tes (ekstraksi, ekstraksi ulang, DLL Windows,
+tidak ada berkas sementara tertinggal, dan ekstraksi paralel).
 
 - [ ] **Step 5: Commit**
 
@@ -4854,26 +5083,39 @@ GOARCH ?= $(shell go env GOARCH)
 PT_V   := 35.0.2
 
 PLATFORM := $(GOOS)-$(GOARCH)
-ADB_NAME := adb
+
+# Arsip platform-tools memakai akhiran -linux.zip / -darwin.zip, sedangkan
+# Windows memakai -win.zip (bukan -windows.zip).
+PT_OS := $(GOOS)
 ifeq ($(GOOS),windows)
-ADB_NAME := adb.exe
+PT_OS := win
 endif
-ADB_DEST := internal/bundle/bin/$(PLATFORM)/$(ADB_NAME)
+
+# adb.exe di Windows memuat AdbWinApi.dll secara statis, jadi DLL bawaan
+# platform-tools harus ikut diekstrak berdampingan dengan adb.exe; tanpa itu
+# adb tidak bisa dijalankan.
+PT_FILES := adb
+ifeq ($(GOOS),windows)
+PT_FILES := adb.exe AdbWinApi.dll AdbWinUsbApi.dll
+endif
+
+ADB_DIR := internal/bundle/bin/$(PLATFORM)
 
 .PHONY: test build run fetch-adb clean fmt vet release
 
 fetch-adb:
 	@echo "mengunduh platform-tools $(PT_V) untuk $(GOOS)"
 	@tmp=$$(mktemp -d); \
-	url="https://dl.google.com/android/repository/platform-tools_r$(PT_V)-$(GOOS).zip"; \
+	url="https://dl.google.com/android/repository/platform-tools_r$(PT_V)-$(PT_OS).zip"; \
 	echo "$$url"; \
 	curl -fsSL -o $$tmp/pt.zip "$$url" || { echo "unduhan gagal"; exit 1; }; \
 	unzip -q -o $$tmp/pt.zip -d $$tmp; \
-	mkdir -p internal/bundle/bin/$(PLATFORM); \
-	cp $$tmp/platform-tools/$(ADB_NAME) $(ADB_DEST); \
-	chmod +x $(ADB_DEST); \
+	mkdir -p $(ADB_DIR); \
+	for f in $(PT_FILES); do cp "$$tmp/platform-tools/$$f" "$(ADB_DIR)/$$f"; done; \
+	chmod +x "$(ADB_DIR)/adb" 2>/dev/null || true; \
+	chmod +x "$(ADB_DIR)/adb.exe" 2>/dev/null || true; \
 	rm -rf $$tmp; \
-	ls -l $(ADB_DEST)
+	ls -l $(ADB_DIR)
 
 test:
 	go test ./...
@@ -4895,7 +5137,11 @@ clean:
 ```
 
 Catatan: nama arsip platform-tools memakai pola
-`platform-tools_r<versi>-<os>.zip` (untuk Windows: `...-windows.zip`). Bila
+`platform-tools_r<versi>-<os>.zip`. Linux/macOS memakai `-linux.zip` /
+`-darwin.zip`, sedangkan Windows memakai `-win.zip` (bukan `-windows.zip`).
+Di Windows, `adb.exe` memuat `AdbWinApi.dll` secara statis sehingga
+`AdbWinApi.dll` dan `AdbWinUsbApi.dll` harus ikut dikirim di folder
+`internal/bundle/bin/<os>-<arch>/`; tanpa itu adb gagal dijalankan. Bila
 unduhan gagal karena pola berubah, periksa
 `https://developer.android.com/tools/releases/platform-tools` dan sesuaikan
 variabel `PT_V`.
@@ -4939,7 +5185,7 @@ jobs:
           - runner: ubuntu-latest
             goos: windows
             goarch: amd64
-            platform_tools: windows
+            platform_tools: win
             archive: zip
           - runner: macos-latest
             goos: darwin
@@ -4966,15 +5212,21 @@ jobs:
         run: |
           set -euo pipefail
           PT_VERSION=35.0.2
-          ADB_NAME=adb
-          if [ "${{ matrix.goos }}" = "windows" ]; then ADB_NAME=adb.exe; fi
+          PT_OS="${{ matrix.platform_tools }}"
+          # adb.exe di Windows memuat AdbWinApi.dll secara statis, jadi DLL itu
+          # harus ikut diekstrak berdampingan dengan adb.exe.
+          FILES=(adb)
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            FILES=(adb.exe AdbWinApi.dll AdbWinUsbApi.dll)
+          fi
           DEST="internal/bundle/bin/${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "$DEST"
           curl -fsSL -o pt.zip \
-            "https://dl.google.com/android/repository/platform-tools_r${PT_VERSION}-${{ matrix.platform_tools }}.zip"
+            "https://dl.google.com/android/repository/platform-tools_r${PT_VERSION}-${PT_OS}.zip"
           unzip -q -o pt.zip
-          cp "platform-tools/${ADB_NAME}" "$DEST/${ADB_NAME}"
-          chmod +x "$DEST/${ADB_NAME}" || true
+          for f in "${FILES[@]}"; do cp "platform-tools/$f" "$DEST/$f"; done
+          chmod +x "$DEST/adb" 2>/dev/null || true
+          chmod +x "$DEST/adb.exe" 2>/dev/null || true
           ls -l "$DEST"
 
       - name: Jalankan pengujian
