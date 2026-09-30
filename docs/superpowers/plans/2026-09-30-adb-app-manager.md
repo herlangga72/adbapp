@@ -12,7 +12,7 @@
 
 **Catatan penyimpangan kecil dari spec:** spec menyebut "adb palsu berupa skrip kecil". Di plan ini penggantinya adalah `Execer` yang bisa disuntik (fake di dalam proses), karena skrip shell tidak jalan di runner Windows saat pengujian CI. Fungsinya sama: seluruh perilaku `adb` bisa disimulasikan.
 
-**Catatan konvensi:** module path dipakai `github.com/herlangga72/adbapp`. Ganti bila nama repo GitHub berbeda, dengan `go mod edit -module github.com/<user>/adbapp` diikuti `go mod tidy`.
+**Catatan konvensi:** module path dipakai `github.com/herlangga72/adbapp`. Ganti bila nama repo GitHub berbeda, dengan `go mod edit -module github.com/herlangga72/adbapp` diikuti `go mod tidy`.
 
 ---
 
@@ -5579,14 +5579,14 @@ Jalankan `adbapp`, lalu browser terbuka otomatis di halaman aplikasi.
 **Linux**
 
 ```bash
-curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-linux-amd64.tar.gz | tar xz -C ~/bin
+curl -fsSL https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-linux-amd64.tar.gz | tar xz -C ~/bin
 ~/bin/adbapp
 ```
 
 **macOS**
 
 ```bash
-curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
+curl -fsSL https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
 ~/bin/adbapp
 ```
 
@@ -5659,6 +5659,83 @@ Expected: tes lulus, build sukses, dan aplikasi mencetak daftar flag
 ```bash
 git add README.md
 git commit -m "docs: README pemakaian, pemasangan, dan pemecahan masalah"
+```
+
+---
+
+## Task 16: Publikasi ke GitHub `herlangga72`
+
+**Files:**
+- Modify: `README.md` (tautan rilis memakai akun nyata, sudah diselaraskan)
+
+Repo tujuan: `github.com/herlangga72/adbapp`. Mesin ini sudah menyiapkan `gh`
+yang login sebagai `herlangga72` dengan protokol SSH dan scope `repo`, jadi repo
+bisa dibuat dan di-push langsung. Workflow dari Task 14 sudah mengunggah aset ke
+halaman Releases, jadi tugas ini hanya menyalakan dan memverifikasinya.
+
+Repo dibuat **publik**, karena rancangan pemasangan yang disetujui memakai satu
+baris `curl` tanpa autentikasi; repo privat akan membuat tautan itu gagal dipakai
+orang lain. Bisa diubah kapan saja lewat
+`gh repo edit herlangga72/adbapp --visibility private` (dengan konsekuensi tautan
+`curl` perlu autentikasi).
+
+- [ ] **Step 1: Pastikan identitas rilis sudah benar**
+
+Run: `head -1 go.mod` dan `grep -c "herlangga72/adbapp" README.md`
+Expected: `module github.com/herlangga72/adbapp`, dan README memuat 2 tautan
+`github.com/herlangga72/adbapp`.
+
+- [ ] **Step 2: Gabungkan ke branch utama, buat repo, lalu push**
+
+```bash
+git checkout master
+git merge --no-ff feat/adbapp -m "feat: adbapp v1.0.0 (pasang dan copot aplikasi Android lewat adb)"
+gh repo create herlangga72/adbapp --public --source=. --remote=origin --push
+```
+
+Expected: repo dibuat, branch `master` ter-push, dan `origin` menunjuk ke
+`git@github.com:herlangga72/adbapp.git`.
+
+- [ ] **Step 3: Jalankan build sekali tanpa tag untuk memastikan matriksnya hijau**
+
+```bash
+gh workflow list
+gh workflow run build-and-release.yml
+gh run list --workflow=build-and-release.yml --limit 1
+```
+
+Expected: workflow `build-and-release` terdaftar dan satu run berjalan. Tanpa tag,
+langkah unggah ke halaman rilis dilewati (memang begitu rancangannya).
+
+- [ ] **Step 4: Terbitkan versi pertama**
+
+```bash
+git tag -a v1.0.0 -m "adbapp v1.0.0"
+git push origin v1.0.0
+gh run list --workflow=build-and-release.yml --limit 1
+```
+
+Expected: satu run baru dipicu oleh tag, keempat kombinasi OS/arsitektur berhasil,
+dan langkah "Unggah ke halaman rilis" mengunggah berkas arsip.
+
+- [ ] **Step 5: Verifikasi aset rilis**
+
+Run: `gh release view v1.0.0 --json assets -q '.assets[].name'`
+Expected: `adbapp-darwin-amd64.tar.gz`, `adbapp-darwin-arm64.tar.gz`,
+`adbapp-linux-amd64.tar.gz`, dan `adbapp-windows-amd64.zip`.
+
+- [ ] **Step 6: Verifikasi tautan installer persis seperti di README**
+
+Run:
+`curl -sIL -o /dev/null -w '%{http_code}\n' https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-linux-amd64.tar.gz`
+Expected: `200`.
+
+- [ ] **Step 7: Commit penyelarasan tautan (bila ada perubahan tertunda)**
+
+```bash
+git add README.md docs/superpowers/plans/2026-09-30-adb-app-manager.md docs/superpowers/specs/2026-09-30-adb-app-manager-design.md
+git commit -m "docs: arahkan tautan rilis ke github.com/herlangga72/adbapp"
+git push origin master
 ```
 
 ---

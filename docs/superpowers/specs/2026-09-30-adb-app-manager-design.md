@@ -191,7 +191,7 @@ Folder data aplikasi mengikuti konvensi tiap OS (Windows:
 repo rilis):
 
 ```
-curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
+curl -fsSL https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
 ```
 
 Berkas yang diambil `curl` tidak diberi label quarantine, sehingga Gatekeeper
