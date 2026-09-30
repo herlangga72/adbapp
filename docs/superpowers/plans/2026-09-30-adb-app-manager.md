@@ -396,6 +396,7 @@ import (
 	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 func assertNoTemps(t *testing.T, dir string) {
@@ -604,6 +605,53 @@ func TestEnsureFromConcurrent(t *testing.T) {
 	}
 	assertNoTemps(t, dir)
 }
+
+func TestEnsureFromRestoresMissingDLL(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/windows-amd64/adb.exe":          &fstest.MapFile{Data: []byte("exe"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinApi.dll":    &fstest.MapFile{Data: []byte("api"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinUsbApi.dll": &fstest.MapFile{Data: []byte("usb"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "windows", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	dll := filepath.Join(dir, "AdbWinApi.dll")
+	if err := os.Remove(dll); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "windows", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dll); err != nil {
+		t.Fatalf("AdbWinApi.dll seharusnya dipulihkan: %v", err)
+	}
+}
+
+func TestEnsureFromCleansStaleTempOnFastPath(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "adb.tmp-stale")
+	if err := os.WriteFile(stale, []byte("sisa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("berkas sementara basi seharusnya dihapus, err: %v", err)
+	}
+	assertNoTemps(t, dir)
+}
 ```
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
@@ -690,8 +738,12 @@ func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
 	stamp := filepath.Join(adbDir, ".version")
 	want := Version + ":" + goos + "-" + goarch
 
+	// Bersihkan sisa berkas sementara dari proses yang gagal sebelumnya, bahkan
+	// ketika ekstraksi ulang tidak diperlukan.
+	removeStaleTemps(adbDir)
+
 	if got, err := os.ReadFile(stamp); err == nil && string(got) == want {
-		if st, err := os.Stat(dst); err == nil && st.Mode().IsRegular() {
+		if bundledFilesPresent(adbDir, files) {
 			return dst, nil
 		}
 	}
@@ -699,7 +751,6 @@ func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
 	if err := os.MkdirAll(adbDir, 0o755); err != nil {
 		return "", fmt.Errorf("membuat folder %s: %w", adbDir, err)
 	}
-	removeStaleTemps(adbDir)
 
 	for _, f := range files {
 		if err := copyFile(fsys, path.Join(srcDir, f), filepath.Join(adbDir, f)); err != nil {
@@ -716,6 +767,19 @@ func notBundledError(goos, goarch string) error {
 	return fmt.Errorf(
 		"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
 		goos, goarch)
+}
+
+// bundledFilesPresent memastikan semua berkas yang seharusnya diekstrak sudah
+// ada sebagai berkas biasa di adbDir. Jika satu saja hilang, ekstraksi ulang
+// perlu dijalankan.
+func bundledFilesPresent(adbDir string, files []string) bool {
+	for _, f := range files {
+		st, err := os.Stat(filepath.Join(adbDir, f))
+		if err != nil || !st.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
 }
 
 // removeStaleTemps membersihkan sisa berkas sementara yang sudah lama
@@ -787,8 +851,9 @@ func copyFile(fsys fs.FS, src, dst string) error {
 - [ ] **Step 4: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/bundle/ -v`
-Expected: PASS untuk seluruh tes (ekstraksi, ekstraksi ulang, DLL Windows,
-tidak ada berkas sementara tertinggal, dan ekstraksi paralel).
+Expected: PASS untuk seluruh tes (ekstraksi, ekstraksi ulang, pemulihan berkas
+bundel yang hilang, DLL Windows, tidak ada berkas sementara tertinggal, temp
+basi dibersihkan, dan ekstraksi paralel).
 
 - [ ] **Step 5: Commit**
 

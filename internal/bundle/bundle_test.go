@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 func assertNoTemps(t *testing.T, dir string) {
@@ -213,6 +214,53 @@ func TestEnsureFromConcurrent(t *testing.T) {
 		if paths[i] == "" {
 			t.Fatalf("goroutine %d mengembalikan path kosong", i)
 		}
+	}
+	assertNoTemps(t, dir)
+}
+
+func TestEnsureFromRestoresMissingDLL(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/windows-amd64/adb.exe":          &fstest.MapFile{Data: []byte("exe"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinApi.dll":    &fstest.MapFile{Data: []byte("api"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinUsbApi.dll": &fstest.MapFile{Data: []byte("usb"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "windows", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	dll := filepath.Join(dir, "AdbWinApi.dll")
+	if err := os.Remove(dll); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "windows", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dll); err != nil {
+		t.Fatalf("AdbWinApi.dll seharusnya dipulihkan: %v", err)
+	}
+}
+
+func TestEnsureFromCleansStaleTempOnFastPath(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "adb.tmp-stale")
+	if err := os.WriteFile(stale, []byte("sisa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("berkas sementara basi seharusnya dihapus, err: %v", err)
 	}
 	assertNoTemps(t, dir)
 }
