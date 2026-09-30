@@ -72,7 +72,9 @@ func firstLine(s string) string {
 }
 
 // looksLikeDeviceNotFound cocok untuk pola "device not found" maupun
-// "device 'SERIAL' not found" (adb menyisipkan nomor seri).
+// "device 'SERIAL' not found". strings.Contains(lower, "device not found")
+// tidak cukup karena adb menyisipkan nomor seri di antara "device" dan
+// "not found".
 func looksLikeDeviceNotFound(lower string) bool {
 	i := strings.Index(lower, "device")
 	if i < 0 {

@@ -1362,6 +1362,9 @@ func firstLine(s string) string {
 Catatan: tes `TestRunClassifiesNonZeroExit` memakai `ErrDeviceNotFound` supaya
 jalur "exit code != 0 diproses `Classify`" bisa diverifikasi sejak Task 3; Task 4
 mengganti seluruh isi `errors.go` dengan daftar sentinel dan pola yang lengkap.
+Catatan: pola `strings.Contains(lower, "device not found")` di sini belum
+menangkap nomor seri (`device 'SERIAL' not found`); perbaikan lengkapnya ada di
+Task 4 lewat `looksLikeDeviceNotFound`.
 
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
@@ -1498,7 +1501,7 @@ func Classify(res Result) error {
 		strings.Contains(lower, "insufficient permissions"),
 		strings.Contains(lower, "unauthorized"):
 		return ErrUnauthorized
-	case strings.Contains(lower, "device not found"),
+	case looksLikeDeviceNotFound(lower),
 		strings.Contains(lower, "device offline"),
 		strings.Contains(lower, "no devices/emulators found"):
 		return ErrDeviceNotFound
@@ -1539,7 +1542,24 @@ func firstLine(s string) string {
 	}
 	return strings.TrimSpace(s)
 }
+
+// looksLikeDeviceNotFound cocok untuk pola "device not found" maupun
+// "device 'SERIAL' not found". strings.Contains(lower, "device not found")
+// tidak cukup karena adb menyisipkan nomor seri di antara "device" dan
+// "not found".
+func looksLikeDeviceNotFound(lower string) bool {
+	i := strings.Index(lower, "device")
+	if i < 0 {
+		return false
+	}
+	return strings.Contains(lower[i:], "not found")
+}
 ```
+
+Catatan: urutan `case` di `Classify` bersifat penting dan tidak boleh diubah
+sembarangan. `not installed for` harus diperiksa sebelum `delete_failed`, dan
+pola `unauthorized` sebelum device-not-found, karena satu keluaran adb dapat
+memuat beberapa penanda sekaligus.
 
 - [ ] **Step 4: Pastikan tidak ada kode sisa**
 
