@@ -5,8 +5,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"time"
 )
 
 // Ensure mengekstrak adb untuk OS saat ini dan mengembalikan path-nya.
@@ -21,13 +23,32 @@ func adbName(goos string) string {
 	return "adb"
 }
 
+// ensureFrom mengekstrak seluruh isi folder bin/<goos>-<goarch>/ ke adbDir.
+// Di Windows, adb.exe memuat AdbWinApi.dll secara statis sehingga DLL tersebut
+// harus ikut diekstrak berdampingan; karena itu unit yang disalin adalah
+// direktori, bukan satu berkas.
 func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
 	name := adbName(goos)
-	src := fmt.Sprintf("bin/%s-%s/%s", goos, goarch, name)
-	if _, err := fs.Stat(fsys, src); err != nil {
-		return "", fmt.Errorf(
-			"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
-			goos, goarch)
+	srcDir := path.Join("bin", goos+"-"+goarch)
+
+	entries, err := fs.ReadDir(fsys, srcDir)
+	if err != nil {
+		return "", notBundledError(goos, goarch)
+	}
+
+	var files []string
+	hasAdb := false
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		files = append(files, e.Name())
+		if e.Name() == name {
+			hasAdb = true
+		}
+	}
+	if !hasAdb {
+		return "", notBundledError(goos, goarch)
 	}
 
 	dst := filepath.Join(adbDir, name)
@@ -35,44 +56,94 @@ func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
 	want := Version + ":" + goos + "-" + goarch
 
 	if got, err := os.ReadFile(stamp); err == nil && string(got) == want {
-		if _, err := os.Stat(dst); err == nil {
+		if st, err := os.Stat(dst); err == nil && st.Mode().IsRegular() {
 			return dst, nil
 		}
 	}
 
 	if err := os.MkdirAll(adbDir, 0o755); err != nil {
-		return "", err
+		return "", fmt.Errorf("membuat folder %s: %w", adbDir, err)
 	}
-	if err := copyFile(fsys, src, dst); err != nil {
-		return "", err
+	removeStaleTemps(adbDir)
+
+	for _, f := range files {
+		if err := copyFile(fsys, path.Join(srcDir, f), filepath.Join(adbDir, f)); err != nil {
+			return "", err
+		}
 	}
 	if err := os.WriteFile(stamp, []byte(want), 0o644); err != nil {
-		return "", err
+		return "", fmt.Errorf("menulis %s: %w", stamp, err)
 	}
 	return dst, nil
 }
 
+func notBundledError(goos, goarch string) error {
+	return fmt.Errorf(
+		"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
+		goos, goarch)
+}
+
+// removeStaleTemps membersihkan sisa berkas sementara yang sudah lama
+// tertinggal. Hanya berkas yang lebih tua dari satu jam yang dihapus supaya
+// ekstraksi paralel yang sedang berjalan tidak terganggu.
+func removeStaleTemps(dir string) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-time.Hour)
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && st.ModTime().Before(cutoff) {
+			os.Remove(m)
+		}
+	}
+}
+
 func copyFile(fsys fs.FS, src, dst string) error {
+	info, err := fs.Stat(fsys, src)
+	if err != nil {
+		return fmt.Errorf("membaca %s: %w", src, err)
+	}
 	in, err := fsys.Open(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("membuka %s: %w", src, err)
 	}
 	defer in.Close()
 
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("membuat berkas sementara untuk %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyalin %s: %w", src, err)
 	}
-	if err := out.Close(); err != nil {
-		return err
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyinkronkan %s: %w", dst, err)
 	}
-	if err := os.Chmod(tmp, 0o755); err != nil {
-		return err
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("menutup berkas sementara %s: %w", tmpName, err)
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		return fmt.Errorf("mengatur mode %s: %w", dst, err)
+	}
+
+	if err := os.Rename(tmpName, dst); err != nil {
+		if rmErr := os.Remove(dst); rmErr == nil {
+			if err := os.Rename(tmpName, dst); err == nil {
+				return nil
+			}
+		}
+		if st, statErr := os.Stat(dst); statErr == nil && st.Mode().IsRegular() && st.Size() == info.Size() {
+			// Berkas tujuan sudah ditulis oleh ekstraksi lain yang berjalan
+			// bersamaan; isinya identik, jadi anggap berhasil.
+			return nil
+		}
+		return fmt.Errorf("memindahkan %s ke %s: %w", tmpName, dst, err)
+	}
+	return nil
 }
