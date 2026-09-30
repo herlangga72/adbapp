@@ -55,9 +55,11 @@
 cd /home/server/autoinstall-and-uninstall-using-adb
 go mod init github.com/herlangga72/adbapp
 go get github.com/avast/apkparser@latest
+go mod edit -go=1.24
 ```
 
-Expected: `go.mod` terbentuk dan `apkparser` tercatat di `require`.
+Expected: `go.mod` terbentuk, `apkparser` tercatat di `require`, dan direktif `go`
+di pin ke `1.24` (bukan versi toolchain lokal).
 
 - [ ] **Step 2: Tulis `.gitignore`**
 
@@ -108,6 +110,9 @@ git commit -m "chore: kerangka modul Go untuk adbapp"
 **Files:**
 - Create: `internal/paths/paths.go`
 - Test: `internal/paths/paths_test.go`
+- Test: `internal/paths/base_linux_test.go` (`//go:build linux`)
+- Test: `internal/paths/base_windows_test.go` (`//go:build windows`)
+- Test: `internal/paths/base_darwin_test.go` (`//go:build darwin`)
 
 - [ ] **Step 1: Tulis tes yang gagal**
 
@@ -117,8 +122,8 @@ Create `internal/paths/paths_test.go`:
 package paths
 
 import (
+	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -149,10 +154,32 @@ func TestEnsureCreatesDirs(t *testing.T) {
 	}
 }
 
-func TestBaseDirUsesXDGOnLinux(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("khusus Linux")
+func TestResolveUsesAdbappDirectory(t *testing.T) {
+	p, err := Resolve()
+	if err != nil {
+		t.Skipf("Resolve error: %v", err)
 	}
+	if got := filepath.Base(p.DataDir); got != "adbapp" {
+		t.Fatalf("got %q, want adbapp", got)
+	}
+}
+
+func isDir(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
+}
+```
+
+Create `internal/paths/base_linux_test.go` (`//go:build linux`):
+
+```go
+//go:build linux
+
+package paths
+
+import "testing"
+
+func TestBaseDirUsesXDGOnLinux(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "/xdg")
 	got, err := baseDir()
 	if err != nil {
@@ -160,6 +187,74 @@ func TestBaseDirUsesXDGOnLinux(t *testing.T) {
 	}
 	if got != "/xdg" {
 		t.Fatalf("got %q, want /xdg", got)
+	}
+}
+
+func TestBaseDirIgnoresRelativeXDG(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "relative/data")
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	if got == "relative/data" {
+		t.Fatalf("baseDir memakai XDG relatif: %q", got)
+	}
+}
+```
+
+Create `internal/paths/base_windows_test.go` (`//go:build windows`):
+
+```go
+//go:build windows
+
+package paths
+
+import "testing"
+
+func TestBaseDirUsesLocalAppData(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", `C:\Users\tester\AppData\Local`)
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	if got != `C:\Users\tester\AppData\Local` {
+		t.Fatalf("got %q, want LOCALAPPDATA", got)
+	}
+}
+
+func TestBaseDirFallsBackWhenLocalAppDataEmpty(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", "")
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	if got == "" {
+		t.Fatal("baseDir mengembalikan path kosong")
+	}
+}
+```
+
+Create `internal/paths/base_darwin_test.go` (`//go:build darwin`):
+
+```go
+//go:build darwin
+
+package paths
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestBaseDirDarwin(t *testing.T) {
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	want := filepath.Join("Library", "Application Support")
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("got %q, want suffix %q", got, want)
 	}
 }
 ```
@@ -184,6 +279,7 @@ import (
 	"runtime"
 )
 
+// Paths adalah lokasi folder data aplikasi dan berkas-berkas yang dikelolanya.
 type Paths struct {
 	DataDir     string
 	AdbDir      string
@@ -222,7 +318,14 @@ func baseDir() (string, error) {
 		if v := os.Getenv("LOCALAPPDATA"); v != "" {
 			return v, nil
 		}
-		return "", fmt.Errorf("variabel LOCALAPPDATA kosong")
+		if v, err := os.UserConfigDir(); err == nil && v != "" {
+			return v, nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, "AppData", "Local"), nil
 	case "darwin":
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -230,7 +333,7 @@ func baseDir() (string, error) {
 		}
 		return filepath.Join(home, "Library", "Application Support"), nil
 	default:
-		if v := os.Getenv("XDG_DATA_HOME"); v != "" {
+		if v := os.Getenv("XDG_DATA_HOME"); v != "" && filepath.IsAbs(v) {
 			return v, nil
 		}
 		home, err := os.UserHomeDir()
@@ -245,15 +348,10 @@ func baseDir() (string, error) {
 func (p Paths) Ensure() error {
 	for _, dir := range []string{p.DataDir, p.AdbDir, p.UploadsDir, p.PulledDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
+			return fmt.Errorf("gagal membuat folder %s: %w", dir, err)
 		}
 	}
 	return nil
-}
-
-func isDir(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && st.IsDir()
 }
 ```
 
