@@ -1,0 +1,6 @@
+/adbapp
+/adbapp.exe
+/internal/bundle/bin/*/
+dist/
+*.apk
+!internal/apkmeta/testdata/*.apk
