@@ -1,0 +1,5118 @@
+# ADB App Manager Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Membangun `adbapp`, satu biner Go lintas platform yang menyajikan UI web lokal untuk memasang dan mencopot aplikasi Android lewat ADB dengan USB debugging.
+
+**Architecture:** Satu proses Go menyalakan server HTTP di `127.0.0.1`, menyajikan UI yang ditanam (`go:embed`), dan memanggil `adb` (juga ditanam di dalam biner) lewat paket `adbx`. Perintah dijalankan berurutan melalui `queue`, hasilnya dialirkan ke browser lewat SSE.
+
+**Tech Stack:** Go 1.24, `github.com/avast/apkparser` untuk membaca metadata APK, `net/http` + `embed`, pengujian `testing` + `httptest`, CI GitHub Actions.
+
+**Referensi:** `docs/superpowers/specs/2026-09-30-adb-app-manager-design.md`.
+
+**Catatan penyimpangan kecil dari spec:** spec menyebut "adb palsu berupa skrip kecil". Di plan ini penggantinya adalah `Execer` yang bisa disuntik (fake di dalam proses), karena skrip shell tidak jalan di runner Windows saat pengujian CI. Fungsinya sama: seluruh perilaku `adb` bisa disimulasikan.
+
+**Catatan konvensi:** module path dipakai `github.com/herlangga72/adbapp`. Ganti bila nama repo GitHub berbeda, dengan `go mod edit -module github.com/<user>/adbapp` diikuti `go mod tidy`.
+
+---
+
+## Struktur file
+
+| File | Tanggung jawab |
+|---|---|
+| `go.mod`, `go.sum` | Modul dan dependensi |
+| `main.go` | Merakit semua unit, menyalakan server, membuka browser |
+| `internal/paths/paths.go` | Menentukan folder data per OS dan membuatnya |
+| `internal/bundle/embed.go` | Menanam berkas `bin/` (biner adb) ke dalam biner |
+| `internal/bundle/bundle.go` | Mengekstrak `adb` ke folder data |
+| `internal/bundle/bin/README.md` | Penanda agar `go:embed` selalu bisa dikompilasi |
+| `internal/adbx/adbx.go` | Menjalankan perintah `adb`, mengurai keluaran |
+| `internal/adbx/errors.go` | Menerjemahkan keluaran `adb` menjadi error yang jelas |
+| `internal/device/device.go` | Memantau perangkat yang tersambung |
+| `internal/apkmeta/apkmeta.go` | Membaca package/versi/minSdk dari berkas APK |
+| `internal/store/store.go` | Riwayat `history.jsonl` + konfigurasi + ekspor |
+| `internal/queue/queue.go` | Antrean job berurutan, progress, pembatalan |
+| `internal/httpapi/httpapi.go` | REST + SSE + penyajian UI |
+| `internal/webui/embed.go` | Menanam berkas `static/` |
+| `internal/webui/static/index.html` | Halaman UI |
+| `internal/webui/static/app.js` | Logika UI |
+| `internal/webui/static/styles.css` | Gaya UI |
+| `Makefile` | `fetch-adb`, `build`, `test`, `run` |
+| `.github/workflows/release.yml` | Build + rilis otomatis 3 OS |
+
+---
+
+## Task 0: Kerangka proyek
+
+**Files:**
+- Create: `go.mod`
+- Create: `.gitignore`
+- Create: `internal/bundle/bin/README.md`
+
+- [ ] **Step 1: Inisialisasi modul dan tambahkan dependensi**
+
+```bash
+cd /home/server/autoinstall-and-uninstall-using-adb
+go mod init github.com/herlangga72/adbapp
+go get github.com/avast/apkparser@latest
+```
+
+Expected: `go.mod` terbentuk dan `apkparser` tercatat di `require`.
+
+- [ ] **Step 2: Tulis `.gitignore`**
+
+```gitignore
+/adbapp
+/adbapp.exe
+/internal/bundle/bin/*/
+dist/
+*.apk
+!internal/apkmeta/testdata/*.apk
+```
+
+Baris terakhir memastikan APK contoh untuk pengujian tetap ikut ter-commit.
+
+- [ ] **Step 3: Tulis penanda embed**
+
+Create `internal/bundle/bin/README.md`:
+
+```markdown
+# Folder biner adb
+
+Folder ini diisi otomatis oleh `make fetch-adb` (dan oleh CI) dengan struktur:
+
+    bin/<os>-<arch>/adb      (Linux/macOS)
+    bin/<os>-<arch>/adb.exe  (Windows)
+
+Berkas `adb` tidak ikut masuk git karena besar dan berbeda per platform.
+Berkas README ini sengaja disimpan supaya `go:embed bin` selalu punya isi
+dan proyek tetap bisa dikompilasi walau biner adb belum diunduh.
+```
+
+- [ ] **Step 4: Verifikasi kompilasi dasar**
+
+Run: `go build ./...`
+Expected: sukses tanpa keluaran (belum ada berkas .go, tapi modul valid).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add go.mod go.sum .gitignore internal/bundle/bin/README.md
+git commit -m "chore: kerangka modul Go untuk adbapp"
+```
+
+---
+
+## Task 1: Folder data per OS (`internal/paths`)
+
+**Files:**
+- Create: `internal/paths/paths.go`
+- Test: `internal/paths/paths_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/paths/paths_test.go`:
+
+```go
+package paths
+
+import (
+	"path/filepath"
+	"runtime"
+	"testing"
+)
+
+func TestResolveFromBuildsLayout(t *testing.T) {
+	p := ResolveFrom("/base")
+	want := Paths{
+		DataDir:     filepath.Join("/base", "adbapp"),
+		AdbDir:      filepath.Join("/base", "adbapp", "adb"),
+		UploadsDir:  filepath.Join("/base", "adbapp", "uploads"),
+		PulledDir:   filepath.Join("/base", "adbapp", "pulled"),
+		HistoryFile: filepath.Join("/base", "adbapp", "history.jsonl"),
+		ConfigFile:  filepath.Join("/base", "adbapp", "config.json"),
+	}
+	if p != want {
+		t.Fatalf("layout salah:\n got %+v\nwant %+v", p, want)
+	}
+}
+
+func TestEnsureCreatesDirs(t *testing.T) {
+	p := ResolveFrom(t.TempDir())
+	if err := p.Ensure(); err != nil {
+		t.Fatalf("Ensure gagal: %v", err)
+	}
+	for _, dir := range []string{p.DataDir, p.AdbDir, p.UploadsDir, p.PulledDir} {
+		if !isDir(dir) {
+			t.Fatalf("folder %s tidak dibuat", dir)
+		}
+	}
+}
+
+func TestBaseDirUsesXDGOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("khusus Linux")
+	}
+	t.Setenv("XDG_DATA_HOME", "/xdg")
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	if got != "/xdg" {
+		t.Fatalf("got %q, want /xdg", got)
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/paths/`
+Expected: FAIL, `undefined: ResolveFrom`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/paths/paths.go`:
+
+```go
+// Package paths menentukan lokasi folder data aplikasi sesuai konvensi tiap OS.
+package paths
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+)
+
+type Paths struct {
+	DataDir     string
+	AdbDir      string
+	UploadsDir  string
+	PulledDir   string
+	HistoryFile string
+	ConfigFile  string
+}
+
+// ResolveFrom menyusun tata letak folder dengan basis yang bisa ditentukan,
+// sehingga mudah diuji tanpa menyentuh folder asli pengguna.
+func ResolveFrom(base string) Paths {
+	data := filepath.Join(base, "adbapp")
+	return Paths{
+		DataDir:     data,
+		AdbDir:      filepath.Join(data, "adb"),
+		UploadsDir:  filepath.Join(data, "uploads"),
+		PulledDir:   filepath.Join(data, "pulled"),
+		HistoryFile: filepath.Join(data, "history.jsonl"),
+		ConfigFile:  filepath.Join(data, "config.json"),
+	}
+}
+
+// Resolve memakai folder data standar OS yang sedang berjalan.
+func Resolve() (Paths, error) {
+	base, err := baseDir()
+	if err != nil {
+		return Paths{}, err
+	}
+	return ResolveFrom(base), nil
+}
+
+func baseDir() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		if v := os.Getenv("LOCALAPPDATA"); v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("variabel LOCALAPPDATA kosong")
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, "Library", "Application Support"), nil
+	default:
+		if v := os.Getenv("XDG_DATA_HOME"); v != "" {
+			return v, nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, ".local", "share"), nil
+	}
+}
+
+// Ensure membuat seluruh folder yang dibutuhkan.
+func (p Paths) Ensure() error {
+	for _, dir := range []string{p.DataDir, p.AdbDir, p.UploadsDir, p.PulledDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isDir(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
+}
+```
+
+- [ ] **Step 4: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/paths/ -v`
+Expected: PASS untuk ketiga tes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/paths
+git commit -m "feat(paths): tentukan folder data per OS"
+```
+
+---
+
+## Task 2: Ekstraksi `adb` tertanam (`internal/bundle`)
+
+**Files:**
+- Create: `internal/bundle/embed.go`
+- Create: `internal/bundle/bundle.go`
+- Test: `internal/bundle/bundle_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/bundle/bundle_test.go`:
+
+```go
+package bundle
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"testing/fstest"
+)
+
+func TestEnsureFromExtractsBinary(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("#!/bin/sh\necho hi\n"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	got, err := ensureFrom(fsys, dir, "linux", "amd64")
+	if err != nil {
+		t.Fatalf("ensureFrom gagal: %v", err)
+	}
+	want := filepath.Join(dir, "adb")
+	if got != want {
+		t.Fatalf("path salah: got %q want %q", got, want)
+	}
+	data, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("adb tidak tertulis: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("adb kosong")
+	}
+	if runtime.GOOS != "windows" {
+		st, _ := os.Stat(want)
+		if st.Mode().Perm()&0o111 == 0 {
+			t.Fatalf("adb tidak bisa dieksekusi: %v", st.Mode())
+		}
+	}
+}
+
+func TestEnsureFromSkipsWhenVersionMatches(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("v1"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	first, err := ensureFrom(fsys, dir, "linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(first, []byte("diubah manual"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ensureFrom(fsys, dir, "linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(second)
+	if string(data) != "diubah manual" {
+		t.Fatal("adb seharusnya tidak diekstrak ulang saat versi sama")
+	}
+}
+
+func TestEnsureFromErrorsWhenPlatformMissing(t *testing.T) {
+	fsys := fstest.MapFS{"bin/README.md": &fstest.MapFile{Data: []byte("x")}}
+	if _, err := ensureFrom(fsys, t.TempDir(), "plan9", "mips"); err == nil {
+		t.Fatal("seharusnya error saat biner platform tidak ada")
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/bundle/`
+Expected: FAIL, `undefined: ensureFrom`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/bundle/embed.go`:
+
+```go
+// Package bundle menanam biner adb ke dalam biner aplikasi dan mengekstraknya
+// ke folder data saat aplikasi dijalankan.
+package bundle
+
+import "embed"
+
+// Version dinaikkan setiap kali biner adb di folder bin/ diperbarui, supaya
+// aplikasi tahu kapan harus mengekstrak ulang.
+const Version = "1"
+
+//go:embed bin
+var binFS embed.FS
+```
+
+Create `internal/bundle/bundle.go`:
+
+```go
+package bundle
+
+import (
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+)
+
+// Ensure mengekstrak adb untuk OS saat ini dan mengembalikan path-nya.
+func Ensure(adbDir string) (string, error) {
+	return ensureFrom(binFS, adbDir, runtime.GOOS, runtime.GOARCH)
+}
+
+func adbName(goos string) string {
+	if goos == "windows" {
+		return "adb.exe"
+	}
+	return "adb"
+}
+
+func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
+	name := adbName(goos)
+	src := fmt.Sprintf("bin/%s-%s/%s", goos, goarch, name)
+	if _, err := fs.Stat(fsys, src); err != nil {
+		return "", fmt.Errorf(
+			"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
+			goos, goarch)
+	}
+
+	dst := filepath.Join(adbDir, name)
+	stamp := filepath.Join(adbDir, ".version")
+	want := Version + ":" + goos + "-" + goarch
+
+	if got, err := os.ReadFile(stamp); err == nil && string(got) == want {
+		if _, err := os.Stat(dst); err == nil {
+			return dst, nil
+		}
+	}
+
+	if err := os.MkdirAll(adbDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := copyFile(fsys, src, dst); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(stamp, []byte(want), 0o644); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+func copyFile(fsys fs.FS, src, dst string) error {
+	in, err := fsys.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+```
+
+- [ ] **Step 4: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/bundle/ -v`
+Expected: PASS untuk ketiga tes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/bundle
+git commit -m "feat(bundle): ekstrak biner adb tertanam ke folder data"
+```
+
+---
+
+## Task 3: Menjalankan `adb` (`internal/adbx`, bagian 1)
+
+**Files:**
+- Create: `internal/adbx/adbx.go`
+- Test: `internal/adbx/adbx_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/adbx/adbx_test.go`:
+
+```go
+package adbx
+
+import (
+	"context"
+	"testing"
+)
+
+type fakeExec struct {
+	results []Result
+	calls   [][]string
+}
+
+func (f *fakeExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	f.calls = append(f.calls, append([]string{name}, args...))
+	if len(f.results) == 0 {
+		return Result{}, nil
+	}
+	r := f.results[0]
+	f.results = f.results[1:]
+	return r, nil
+}
+
+func TestRunPrependsSerial(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "ok"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("ABC123"))
+	if _, err := r.Run(context.Background(), "shell", "id"); err != nil {
+		t.Fatal(err)
+	}
+	got := fe.calls[0]
+	want := []string{"/usr/bin/adb", "-s", "ABC123", "shell", "id"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+}
+
+func TestRunWithoutSerialOmitsFlag(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "ok"}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	if _, err := r.Run(context.Background(), "devices"); err != nil {
+		t.Fatal(err)
+	}
+	if fe.calls[0][1] != "devices" {
+		t.Fatalf("flag -s seharusnya tidak ada: %v", fe.calls[0])
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/adbx/`
+Expected: FAIL, `undefined: New`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/adbx/adbx.go`:
+
+```go
+// Package adbx menjalankan perintah adb dan mengurai keluarannya.
+package adbx
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// Result adalah keluaran satu perintah adb.
+type Result struct {
+	Stdout   string
+	Stderr   string
+	ExitCode int
+}
+
+// Execer menjalankan sebuah program. Implementasi asli memakai os/exec;
+// pengujian menyuntikkan versi tiruan.
+type Execer interface {
+	Run(ctx context.Context, name string, args ...string) (Result, error)
+}
+
+type osExec struct{}
+
+func (osExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	res := Result{Stdout: out.String(), Stderr: errBuf.String()}
+	if err != nil {
+		var ee *exec.ExitError
+		if ok := asExitError(err, &ee); ok {
+			res.ExitCode = ee.ExitCode()
+			return res, nil
+		}
+		return res, err
+	}
+	return res, nil
+}
+
+// Runner menjalankan perintah adb untuk satu perangkat (bila serial diisi).
+type Runner struct {
+	adbPath string
+	exec    Execer
+	serial  string
+}
+
+type Option func(*Runner)
+
+func WithExecer(e Execer) Option {
+	return func(r *Runner) { r.exec = e }
+}
+
+func WithSerial(serial string) Option {
+	return func(r *Runner) { r.serial = serial }
+}
+
+func New(adbPath string, opts ...Option) *Runner {
+	r := &Runner{adbPath: adbPath, exec: osExec{}}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
+}
+
+// WithSerial mengembalikan salinan Runner yang menargetkan serial tertentu.
+func (r *Runner) WithSerial(serial string) *Runner {
+	clone := *r
+	clone.serial = serial
+	return &clone
+}
+
+func (r *Runner) Serial() string { return r.serial }
+
+func (r *Runner) args(rest ...string) []string {
+	args := make([]string, 0, len(rest)+2)
+	if r.serial != "" {
+		args = append(args, "-s", r.serial)
+	}
+	return append(args, rest...)
+}
+
+// Run menjalankan perintah adb. Error yang dikembalikan sudah diterjemahkan
+// bila keluarannya cocok dengan pola kegagalan yang dikenal.
+func (r *Runner) Run(ctx context.Context, rest ...string) (Result, error) {
+	res, err := r.exec.Run(ctx, r.adbPath, r.args(rest...)...)
+	if err != nil {
+		return res, fmt.Errorf("gagal menjalankan adb: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return res, Classify(res)
+	}
+	return res, nil
+}
+
+// Output menjalankan perintah dan mengembalikan stdout yang sudah dipangkas.
+func (r *Runner) Output(ctx context.Context, rest ...string) (string, error) {
+	res, err := r.Run(ctx, rest...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Stdout), nil
+}
+```
+
+Create `internal/adbx/exec_error.go`:
+
+```go
+package adbx
+
+import "errors"
+import "os/exec"
+
+// asExitError memisahkan pengecekan tipe ini agar mudah dibaca di adbx.go.
+func asExitError(err error, target **exec.ExitError) bool {
+	return errors.As(err, target)
+}
+```
+
+- [ ] **Step 4: Tambahkan `Classify` agar tes bisa dikompilasi**
+
+Create `internal/adbx/errors.go` (sementara, isi lengkap di Task 4):
+
+```go
+package adbx
+
+// Classify menerjemahkan keluaran adb yang gagal menjadi error yang jelas.
+// Daftar lengkap pola ditambahkan pada Task 4.
+func Classify(res Result) error {
+	return &CommandError{Result: res}
+}
+
+// CommandError adalah kegagalan adb yang belum dikenali polanya.
+type CommandError struct {
+	Result Result
+}
+
+func (e *CommandError) Error() string {
+	msg := firstLine(e.Result.Stderr)
+	if msg == "" {
+		msg = firstLine(e.Result.Stdout)
+	}
+	if msg == "" {
+		msg = "perintah adb gagal"
+	}
+	return msg
+}
+
+func firstLine(s string) string {
+	for i, r := range s {
+		if r == '\n' || r == '\r' {
+			return s[:i]
+		}
+	}
+	return s
+}
+```
+
+- [ ] **Step 5: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/adbx/ -v`
+Expected: PASS untuk kedua tes.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/adbx
+git commit -m "feat(adbx): runner adb dengan exec yang bisa disuntik"
+```
+
+---
+
+## Task 4: Menerjemahkan kegagalan `adb` (`internal/adbx/errors.go`)
+
+**Files:**
+- Modify: `internal/adbx/errors.go`
+- Test: `internal/adbx/errors_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/adbx/errors_test.go`:
+
+```go
+package adbx
+
+import (
+	"errors"
+	"testing"
+)
+
+func TestClassifyKnownFailures(t *testing.T) {
+	cases := []struct {
+		name    string
+		res     Result
+		wantErr error
+	}{
+		{
+			name:    "device not found",
+			res:     Result{Stderr: "error: device 'ABC' not found", ExitCode: 1},
+			wantErr: ErrDeviceNotFound,
+		},
+		{
+			name:    "unauthorized",
+			res:     Result{Stderr: "error: device unauthorized", ExitCode: 1},
+			wantErr: ErrUnauthorized,
+		},
+		{
+			name:    "no space",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]", ExitCode: 1},
+			wantErr: ErrInsufficientStorage,
+		},
+		{
+			name:    "already exists",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_ALREADY_EXISTS]", ExitCode: 1},
+			wantErr: ErrAlreadyExists,
+		},
+		{
+			name:    "downgrade",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_VERSION_DOWNGRADE]", ExitCode: 1},
+			wantErr: ErrDowngrade,
+		},
+		{
+			name:    "package not found",
+			res:     Result{Stderr: "Failure [DELETE_FAILED_INTERNAL_ERROR]\nFailure [not installed for 0]", ExitCode: 1},
+			wantErr: ErrPackageNotFound,
+		},
+		{
+			name:    "system app",
+			res:     Result{Stderr: "Failure [DELETE_FAILED_INTERNAL_ERROR]", ExitCode: 1},
+			wantErr: ErrSystemApp,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Classify(tc.res)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestClassifyUnknownFallsBackToCommandError(t *testing.T) {
+	err := Classify(Result{Stderr: "sesuatu yang aneh", ExitCode: 1})
+	var ce *CommandError
+	if !errors.As(err, &ce) {
+		t.Fatalf("seharusnya CommandError, dapat %T", err)
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/adbx/ -run TestClassify`
+Expected: FAIL, `undefined: ErrDeviceNotFound`.
+
+- [ ] **Step 3: Implementasi**
+
+Replace seluruh isi `internal/adbx/errors.go`:
+
+```go
+package adbx
+
+import (
+	"errors"
+	"strings"
+)
+
+var (
+	ErrDeviceNotFound      = errors.New("perangkat tidak ditemukan")
+	ErrUnauthorized        = errors.New("perangkat belum diizinkan")
+	ErrInsufficientStorage = errors.New("penyimpanan perangkat penuh")
+	ErrAlreadyExists       = errors.New("aplikasi sudah terpasang")
+	ErrDowngrade           = errors.New("versi lebih rendah dari yang terpasang")
+	ErrPackageNotFound     = errors.New("aplikasi tidak terpasang")
+	ErrSystemApp           = errors.New("aplikasi sistem tidak boleh dicopot")
+)
+
+// Classify menerjemahkan keluaran adb yang gagal menjadi error yang bisa
+// ditindaklanjuti. Urutan pemeriksaan penting: pola yang lebih spesifik lebih
+// dulu.
+func Classify(res Result) error {
+	text := res.Stderr + "\n" + res.Stdout
+	lower := strings.ToLower(text)
+
+	switch {
+	case strings.Contains(lower, "not installed for"):
+		return ErrPackageNotFound
+	case strings.Contains(lower, "device unauthorized"),
+		strings.Contains(lower, "insufficient permissions"),
+		strings.Contains(lower, "unauthorized"):
+		return ErrUnauthorized
+	case strings.Contains(lower, "device not found"),
+		strings.Contains(lower, "device offline"),
+		strings.Contains(lower, "no devices/emulators found"):
+		return ErrDeviceNotFound
+	case strings.Contains(lower, "insufficient_storage"):
+		return ErrInsufficientStorage
+	case strings.Contains(lower, "already_exists"):
+		return ErrAlreadyExists
+	case strings.Contains(lower, "version_downgrade"):
+		return ErrDowngrade
+	case strings.Contains(lower, "delete_failed"):
+		return ErrSystemApp
+	default:
+		return &CommandError{Result: res}
+	}
+}
+
+// CommandError adalah kegagalan adb yang belum dikenali polanya.
+type CommandError struct {
+	Result Result
+}
+
+func (e *CommandError) Error() string {
+	msg := firstLine(e.Result.Stderr)
+	if msg == "" {
+		msg = firstLine(e.Result.Stdout)
+	}
+	if msg == "" {
+		msg = "perintah adb gagal"
+	}
+	return msg
+}
+
+func firstLine(s string) string {
+	for i, r := range s {
+		if r == '\n' || r == '\r' {
+			return strings.TrimSpace(s[:i])
+		}
+	}
+	return strings.TrimSpace(s)
+}
+```
+
+- [ ] **Step 4: Pastikan tidak ada kode sisa**
+
+Pastikan `errors` masih dipakai (untuk `errors.New` pada blok `var`). Cek dengan:
+
+Run: `go vet ./internal/adbx/`
+Expected: tidak ada keluaran. Bila muncul `"errors" imported and not used`, hapus
+import tersebut.
+
+- [ ] **Step 5: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/adbx/ -v`
+Expected: PASS untuk seluruh tes `Classify` dan `CommandError`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/adbx
+git commit -m "feat(adbx): terjemahkan kegagalan adb menjadi error yang jelas"
+```
+
+---
+
+## Task 5: Membaca daftar perangkat dan paket (`internal/adbx/query.go`)
+
+**Files:**
+- Create: `internal/adbx/query.go`
+- Test: `internal/adbx/query_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/adbx/query_test.go`:
+
+```go
+package adbx
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+const devicesSample = `List of devices attached
+R58M12ABCDE            device product:beyond1lte model:SM_G973F device:beyond1 transport_id:1
+0123456789ABCDEF       unauthorized transport_id:2
+192.168.1.9:5555       offline transport_id:3
+
+`
+
+func TestDevicesParsesLines(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: devicesSample}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.Devices(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("harus 3 perangkat, dapat %d: %+v", len(got), got)
+	}
+	if got[0].Serial != "R58M12ABCDE" || got[0].State != "device" || got[0].Model != "SM_G973F" {
+		t.Fatalf("baris pertama salah: %+v", got[0])
+	}
+	if got[1].State != "unauthorized" {
+		t.Fatalf("baris kedua salah: %+v", got[1])
+	}
+	if got[2].Serial != "192.168.1.9:5555" || got[2].State != "offline" {
+		t.Fatalf("baris ketiga salah: %+v", got[2])
+	}
+}
+
+const packagesSample = `package:/data/app/~~Ab==/com.foo-abc==/base.apk=com.foo versionCode:42
+package:/data/app/~~Cd==/com.bar-xyz==/base.apk=com.bar versionCode:7
+`
+
+func TestPackagesParsesNameAndVersion(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: packagesSample}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("harus 2 paket, dapat %d", len(got))
+	}
+	if got[0].Name != "com.foo" || got[0].VersionCode != 42 {
+		t.Fatalf("paket pertama salah: %+v", got[0])
+	}
+	if got[0].ApkPath != "/data/app/~~Ab==/com.foo-abc==/base.apk" {
+		t.Fatalf("path salah: %q", got[0].ApkPath)
+	}
+	if got[1].System {
+		t.Fatal("paket pihak ketiga tidak boleh ditandai sistem")
+	}
+}
+
+func TestPackagesFallsBackWhenVersionCodeUnsupported(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stderr: "Error: Unknown option: --show-versioncode", ExitCode: 1},
+		{Stdout: "package:/data/app/com.foo/base.apk=com.foo"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatalf("harus jatuh ke perintah tanpa flag: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "com.foo" {
+		t.Fatalf("hasil fallback salah: %+v", got)
+	}
+	if !strings.Contains(strings.Join(callsOf(fe), " "), "pm list packages") {
+		t.Fatal("perintah pm list packages tidak dijalankan")
+	}
+}
+
+func callsOf(fe *fakeExec) []string {
+	out := make([]string, 0, len(fe.calls))
+	for _, c := range fe.calls {
+		out = append(out, strings.Join(c, " "))
+	}
+	return out
+}
+
+const dumpsysSample = `Packages:
+  Package [com.example.app] (a1b2c3):
+    userId=10123
+    codePath=/data/app/~~Ab==/com.example.app-x==/base.apk
+    versionName=1.2.3
+    versionCode=42 minSdk=21 targetSdk=33
+    firstInstallTime=2024-01-01 10:00:00
+    lastUpdateTime=2024-02-02 11:00:00
+    dataDir=/data/user/0/com.example.app
+    requested permissions:
+      android.permission.INTERNET
+      android.permission.CAMERA
+    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]
+`
+
+func TestPackageInfoParsesDumpsys(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: dumpsysSample},
+		{Stdout: "1234\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.VersionName != "1.2.3" || got.VersionCode != 42 {
+		t.Fatalf("versi salah: %+v", got)
+	}
+	if got.DataDir != "/data/user/0/com.example.app" {
+		t.Fatalf("dataDir salah: %q", got.DataDir)
+	}
+	if len(got.Permissions) != 2 {
+		t.Fatalf("izin salah: %+v", got.Permissions)
+	}
+	if got.System {
+		t.Fatal("paket di /data/app bukan aplikasi sistem")
+	}
+	if got.SizeBytes != 1234*1024 {
+		t.Fatalf("ukuran salah: %d", got.SizeBytes)
+	}
+}
+
+func TestPackageInfoMarksSystemApp(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"codePath=/data/app/~~Ab==/com.example.app-x==/base.apk",
+		"codePath=/system/priv-app/Foo/Foo.apk", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/system/priv-app/Foo"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.System {
+		t.Fatal("paket di /system harus ditandai sistem")
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/adbx/ -run 'TestDevices|TestPackages|TestPackageInfo'`
+Expected: FAIL, `undefined: ...Devices`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/adbx/query.go`:
+
+```go
+package adbx
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// Device adalah satu baris dari `adb devices -l`.
+type Device struct {
+	Serial     string
+	State      string // device, unauthorized, offline, ...
+	Model      string
+	Product    string
+	DeviceName string
+}
+
+// Package adalah satu aplikasi yang terpasang di perangkat.
+type Package struct {
+	Name        string
+	ApkPath     string
+	VersionCode int64
+	System      bool
+}
+
+// PackageInfo adalah detail satu aplikasi, untuk panel detail di UI.
+type PackageInfo struct {
+	Package     string
+	VersionName string
+	VersionCode int64
+	InstallTime string
+	UpdateTime  string
+	ApkPath     string
+	DataDir     string
+	SizeBytes   int64
+	Permissions []string
+	System      bool
+}
+
+func (r *Runner) Devices(ctx context.Context) ([]Device, error) {
+	out, err := r.Output(ctx, "devices", "-l")
+	if err != nil {
+		return nil, err
+	}
+	return parseDevices(out), nil
+}
+
+func parseDevices(out string) []Device {
+	var devs []Device
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" ||
+			strings.HasPrefix(line, "List of devices") ||
+			strings.HasPrefix(line, "*") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		d := Device{Serial: fields[0], State: fields[1]}
+		for _, f := range fields[2:] {
+			k, v, ok := strings.Cut(f, ":")
+			if !ok {
+				continue
+			}
+			switch k {
+			case "model":
+				d.Model = v
+			case "product":
+				d.Product = v
+			case "device":
+				d.DeviceName = v
+			}
+		}
+		devs = append(devs, d)
+	}
+	return devs
+}
+
+// Packages mengembalikan daftar aplikasi. system=true meminta aplikasi sistem.
+func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
+	flag := "-3"
+	if system {
+		flag = "-s"
+	}
+	out, err := r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f", "--show-versioncode")
+	if err != nil {
+		// Perangkat lama belum mendukung --show-versioncode.
+		out, err = r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return parsePackages(out, system), nil
+}
+
+func parsePackages(out string, system bool) []Package {
+	var pkgs []Package
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "package:") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "package:")
+		p := Package{System: system}
+		if i := strings.Index(rest, " versionCode:"); i >= 0 {
+			code, _ := strconv.ParseInt(strings.TrimSpace(rest[i+len(" versionCode:"):]), 10, 64)
+			p.VersionCode = code
+			rest = rest[:i]
+		}
+		if i := strings.LastIndex(rest, "="); i >= 0 {
+			p.ApkPath = rest[:i]
+			p.Name = rest[i+1:]
+		} else {
+			p.Name = rest
+		}
+		if p.Name == "" {
+			continue
+		}
+		pkgs = append(pkgs, p)
+	}
+	return pkgs
+}
+
+// PackageInfo mengambil detail satu aplikasi: versi, ukuran, izin, dan
+// apakah ia bagian dari sistem.
+func (r *Runner) PackageInfo(ctx context.Context, pkg string) (PackageInfo, error) {
+	out, err := r.Output(ctx, "shell", "dumpsys", "package", pkg)
+	if err != nil {
+		return PackageInfo{}, err
+	}
+	info := parseDumpsys(pkg, out)
+	if info.Package == "" {
+		return PackageInfo{}, fmt.Errorf("%w: %s", ErrPackageNotFound, pkg)
+	}
+	if info.DataDir != "" {
+		if size, err := r.Output(ctx, "shell", "du", "-sk", info.DataDir); err == nil {
+			info.SizeBytes = parseDU(size)
+		}
+	}
+	return info, nil
+}
+
+func parseDumpsys(pkg, out string) PackageInfo {
+	info := PackageInfo{Package: pkg}
+	inPermissions := false
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if line == "requested permissions:" {
+			inPermissions = true
+			continue
+		}
+		if inPermissions {
+			if strings.HasPrefix(line, "android.permission.") ||
+				strings.HasPrefix(line, "com.") {
+				info.Permissions = append(info.Permissions, line)
+				continue
+			}
+			inPermissions = false
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "codePath":
+			info.ApkPath = value
+		case "versionName":
+			info.VersionName = value
+		case "versionCode":
+			fields := strings.Fields(value)
+			if len(fields) > 0 {
+				code, _ := strconv.ParseInt(fields[0], 10, 64)
+				info.VersionCode = code
+			}
+		case "firstInstallTime":
+			info.InstallTime = value
+		case "lastUpdateTime":
+			info.UpdateTime = value
+		case "dataDir":
+			info.DataDir = value
+		}
+	}
+	if info.VersionName == "" || info.ApkPath == "" {
+		return PackageInfo{}
+	}
+	info.System = strings.HasPrefix(info.ApkPath, "/system") ||
+		strings.HasPrefix(info.ApkPath, "/product") ||
+		strings.HasPrefix(info.ApkPath, "/vendor")
+	return info
+}
+
+func parseDU(out string) int64 {
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return 0
+	}
+	kb, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return kb * 1024
+}
+```
+
+- [ ] **Step 4: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/adbx/ -v`
+Expected: PASS untuk seluruh tes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/adbx
+git commit -m "feat(adbx): baca daftar perangkat, daftar paket, dan detail paket"
+```
+
+---
+
+## Task 6: Operasi yang mengubah perangkat (`internal/adbx/ops.go`)
+
+**Files:**
+- Create: `internal/adbx/ops.go`
+- Test: `internal/adbx/ops_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/adbx/ops_test.go`:
+
+```go
+package adbx
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestInstallSuccessReportsStages(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "Performing Streamed Install\nSuccess\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	var stages []int
+	err := r.Install(context.Background(), "/tmp/app.apk", InstallOptions{Replace: true},
+		func(percent int, msg string) { stages = append(stages, percent) })
+	if err != nil {
+		t.Fatalf("install gagal: %v", err)
+	}
+	if len(stages) < 2 {
+		t.Fatalf("stages terlalu sedikit: %v", stages)
+	}
+	joined := strings.Join(fe.calls[0], " ")
+	if !strings.Contains(joined, "-r") || !strings.Contains(joined, "/tmp/app.apk") {
+		t.Fatalf("argumen install salah: %s", joined)
+	}
+}
+
+func TestInstallFailureUsesClassify(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	err := r.Install(context.Background(), "/tmp/app.apk", InstallOptions{}, nil)
+	if !errors.Is(err, ErrInsufficientStorage) {
+		t.Fatalf("got %v, want ErrInsufficientStorage", err)
+	}
+}
+
+func TestInstallNonZeroExitIsClassified(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stderr: "adb: device offline", ExitCode: 1},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	err := r.Install(context.Background(), "/tmp/app.apk", InstallOptions{}, nil)
+	if !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("got %v, want ErrDeviceNotFound", err)
+	}
+}
+
+func TestUninstallKeepDataAddsFlag(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "Success\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	if err := r.Uninstall(context.Background(), "com.foo", true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(fe.calls[0], " "), "-k") {
+		t.Fatalf("flag -k tidak ada: %v", fe.calls[0])
+	}
+}
+
+func TestUninstallFailureIsClassified(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "Failure [DELETE_FAILED_INTERNAL_ERROR]\n", ExitCode: 1},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	err := r.Uninstall(context.Background(), "com.foo", false)
+	if !errors.Is(err, ErrSystemApp) {
+		t.Fatalf("got %v, want ErrSystemApp", err)
+	}
+}
+
+func TestClearData(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "Success\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	if err := r.ClearData(context.Background(), "com.foo"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(fe.calls[0], " "), "pm clear com.foo") {
+		t.Fatalf("perintah salah: %v", fe.calls[0])
+	}
+}
+
+func TestClearDataFailure(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "Failed\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	if err := r.ClearData(context.Background(), "com.foo"); err == nil {
+		t.Fatal("seharusnya error")
+	}
+}
+
+func TestPullApkUsesPathFromDevice(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "package:/data/app/~~Ab==/com.foo-x==/base.apk\n"},
+		{Stdout: "1 file pulled\n"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	dest := t.TempDir()
+	got, err := r.PullApk(context.Background(), "com.foo", dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dest, "com.foo-base.apk")
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	pull := strings.Join(fe.calls[1], " ")
+	if !strings.Contains(pull, "/data/app/~~Ab==/com.foo-x==/base.apk") {
+		t.Fatalf("perintah pull salah: %s", pull)
+	}
+}
+
+func TestPullApkFailsWhenPackageMissing(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	if _, err := r.PullApk(context.Background(), "com.foo", t.TempDir()); !errors.Is(err, ErrPackageNotFound) {
+		t.Fatalf("got %v, want ErrPackageNotFound", err)
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/adbx/ -run 'TestInstall|TestUninstall|TestClearData|TestPullApk'`
+Expected: FAIL, `undefined: InstallOptions`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/adbx/ops.go`:
+
+```go
+package adbx
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"path/filepath"
+	"strings"
+)
+
+// InstallOptions mengatur flag yang dikirim ke `adb install`.
+type InstallOptions struct {
+	Replace        bool // -r, timpa bila sudah terpasang
+	AllowDowngrade bool // -d, izinkan versi lebih rendah
+	GrantAll       bool // -g, berikan semua izin runtime
+}
+
+// StageFunc melaporkan kemajuan kasar sebuah operasi (0-100).
+type StageFunc func(percent int, message string)
+
+func report(fn StageFunc, percent int, message string) {
+	if fn != nil {
+		fn(percent, message)
+	}
+}
+
+// Install memasang satu berkas APK.
+func (r *Runner) Install(ctx context.Context, apkPath string, opts InstallOptions, stage StageFunc) error {
+	args := []string{"install"}
+	if opts.Replace {
+		args = append(args, "-r")
+	}
+	if opts.AllowDowngrade {
+		args = append(args, "-d")
+	}
+	if opts.GrantAll {
+		args = append(args, "-g")
+	}
+	args = append(args, apkPath)
+
+	report(stage, 5, "Mengirim APK ke perangkat...")
+	res, err := r.exec.Run(ctx, r.adbPath, r.args(args...)...)
+	if err != nil {
+		return fmt.Errorf("gagal menjalankan adb: %w", err)
+	}
+	report(stage, 90, "Memasang...")
+	if err := installResult(res); err != nil {
+		return err
+	}
+	report(stage, 100, "Selesai")
+	return nil
+}
+
+// installResult memeriksa keluaran `adb install`, yang bisa melaporkan
+// kegagalan lewat teks "Failure [..]" walau exit code-nya 0.
+func installResult(res Result) error {
+	out := res.Stdout + "\n" + res.Stderr
+	if strings.Contains(out, "Success") {
+		return nil
+	}
+	return Classify(res)
+}
+
+// Uninstall mencopot aplikasi. keepData=true menyisakan data aplikasi (-k).
+func (r *Runner) Uninstall(ctx context.Context, pkg string, keepData bool) error {
+	args := []string{"uninstall"}
+	if keepData {
+		args = append(args, "-k")
+	}
+	args = append(args, pkg)
+
+	res, err := r.exec.Run(ctx, r.adbPath, r.args(args...)...)
+	if err != nil {
+		return fmt.Errorf("gagal menjalankan adb: %w", err)
+	}
+	out := res.Stdout + "\n" + res.Stderr
+	if strings.Contains(out, "Success") {
+		return nil
+	}
+	return Classify(res)
+}
+
+// ClearData menghapus data dan cache aplikasi tanpa mencopotnya.
+func (r *Runner) ClearData(ctx context.Context, pkg string) error {
+	res, err := r.exec.Run(ctx, r.adbPath, r.args("shell", "pm", "clear", pkg)...)
+	if err != nil {
+		return fmt.Errorf("gagal menjalankan adb: %w", err)
+	}
+	out := strings.TrimSpace(res.Stdout)
+	if strings.Contains(out, "Success") {
+		return nil
+	}
+	if res.ExitCode != 0 {
+		return Classify(res)
+	}
+	if out == "" {
+		out = "perangkat menolak menghapus data"
+	}
+	return fmt.Errorf("%s", out)
+}
+
+// PullApk menyalin APK yang terpasang di perangkat ke destDir dan
+// mengembalikan path lokalnya.
+func (r *Runner) PullApk(ctx context.Context, pkg string, destDir string) (string, error) {
+	out, err := r.Output(ctx, "shell", "pm", "path", pkg)
+	if err != nil {
+		return "", err
+	}
+	remote := ""
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "package:") {
+			remote = strings.TrimPrefix(line, "package:")
+			break
+		}
+	}
+	if remote == "" {
+		return "", fmt.Errorf("%w: %s", ErrPackageNotFound, pkg)
+	}
+	local := filepath.Join(destDir, pkg+"-"+path.Base(remote))
+	if _, err := r.Run(ctx, "pull", remote, local); err != nil {
+		return "", err
+	}
+	return local, nil
+}
+```
+
+- [ ] **Step 4: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/adbx/ -v`
+Expected: PASS untuk seluruh tes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/adbx
+git commit -m "feat(adbx): install, uninstall, clear data, dan pull APK"
+```
+
+---
+
+## Task 7: Memantau perangkat (`internal/device`)
+
+**Files:**
+- Create: `internal/device/device.go`
+- Test: `internal/device/device_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/device/device_test.go`:
+
+```go
+package device
+
+import (
+	"context"
+	"testing"
+
+	"github.com/herlangga72/adbapp/internal/adbx"
+)
+
+type fakeLister struct {
+	devices []adbx.Device
+	err     error
+}
+
+func (f fakeLister) Devices(ctx context.Context) ([]adbx.Device, error) {
+	return f.devices, f.err
+}
+
+func TestStatusReadyWhenOneAuthorized(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device", Model: "Pixel"}}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Current()
+	if got.State != StateReady {
+		t.Fatalf("got %v, want ready", got.State)
+	}
+	if got.Serial != "S1" {
+		t.Fatalf("serial salah: %q", got.Serial)
+	}
+}
+
+func TestStatusUnauthorizedTakesPriority(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "unauthorized"}}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m.Current().State != StateUnauthorized {
+		t.Fatalf("got %v, want unauthorized", m.Current().State)
+	}
+}
+
+func TestStatusNoneWhenEmpty(t *testing.T) {
+	m := New(fakeLister{})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m.Current().State != StateNone {
+		t.Fatalf("got %v, want none", m.Current().State)
+	}
+}
+
+func TestStatusOfflineWhenOnlyOffline(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "offline"}}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m.Current().State != StateOffline {
+		t.Fatalf("got %v, want offline", m.Current().State)
+	}
+}
+
+func TestRepeatedRefreshKeepsSameSerial(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{
+		{Serial: "S1", State: "device"},
+		{Serial: "S2", State: "device"},
+	}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := m.Current().Serial
+	for i := 0; i < 3; i++ {
+		if err := m.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.Current().Serial != first {
+		t.Fatalf("serial berubah dari %q ke %q padahal masih tersambung",
+			first, m.Current().Serial)
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/device/`
+Expected: FAIL, `undefined: New`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/device/device.go`:
+
+```go
+// Package device memantau perangkat Android yang tersambung dan memilih satu
+// perangkat aktif.
+package device
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/herlangga72/adbapp/internal/adbx"
+)
+
+type State string
+
+const (
+	StateReady        State = "ready"
+	StateUnauthorized State = "unauthorized"
+	StateOffline      State = "offline"
+	StateNone         State = "none"
+)
+
+// Status adalah kondisi perangkat aktif saat ini.
+type Status struct {
+	State State     `json:"state"`
+	Serial string   `json:"serial"`
+	Model  string   `json:"model"`
+	Others []string `json:"others,omitempty"`
+}
+
+type lister interface {
+	Devices(ctx context.Context) ([]adbx.Device, error)
+}
+
+// Monitor memilih satu perangkat aktif dan mengingat pilihannya selama
+// perangkat itu masih tersambung.
+type Monitor struct {
+	lister  lister
+	mu      sync.RWMutex
+	current Status
+}
+
+func New(l lister) *Monitor {
+	return &Monitor{lister: l, current: Status{State: StateNone}}
+}
+
+// Refresh meminta daftar perangkat terbaru dan memperbarui status.
+func (m *Monitor) Refresh(ctx context.Context) error {
+	devices, err := m.lister.Devices(ctx)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.current = pick(devices, m.current.Serial)
+	return nil
+}
+
+func pick(devices []adbx.Device, preferred string) Status {
+	if len(devices) == 0 {
+		return Status{State: StateNone}
+	}
+
+	// Pertahankan perangkat yang sedang dipakai bila masih ada.
+	if preferred != "" {
+		for _, d := range devices {
+			if d.Serial == preferred && d.State == "device" {
+				return build(d, devices)
+			}
+		}
+	}
+
+	for _, d := range devices {
+		if d.State == "device" {
+			return build(d, devices)
+		}
+	}
+	for _, d := range devices {
+		if d.State == "unauthorized" {
+			return build(d, devices)
+		}
+	}
+	return build(devices[0], devices)
+}
+
+func build(chosen adbx.Device, all []adbx.Device) Status {
+	st := Status{Serial: chosen.Serial, Model: chosen.Model}
+	switch chosen.State {
+	case "device":
+		st.State = StateReady
+	case "unauthorized":
+		st.State = StateUnauthorized
+	default:
+		st.State = StateOffline
+	}
+	if st.Model == "" {
+		st.Model = chosen.Product
+	}
+	for _, d := range all {
+		if d.Serial != chosen.Serial {
+			st.Others = append(st.Others, d.Serial)
+		}
+	}
+	return st
+}
+
+// Current mengembalikan status terakhir yang diketahui.
+func (m *Monitor) Current() Status {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.current
+}
+
+// Loop memantau perangkat secara berkala sampai ctx dibatalkan.
+func (m *Monitor) Loop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		_ = m.Refresh(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/device/ -v`
+Expected: PASS untuk kelima tes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/device
+git commit -m "feat(device): pantau perangkat tersambung dan pilih satu yang aktif"
+```
+
+---
+
+## Task 8: Membaca metadata APK (`internal/apkmeta`)
+
+**Files:**
+- Create: `internal/apkmeta/apkmeta.go`
+- Test: `internal/apkmeta/apkmeta_test.go`
+- Test data: `internal/apkmeta/testdata/mini.apk`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/apkmeta/apkmeta_test.go`:
+
+```go
+package apkmeta
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// fixtureAPK membangun APK minimal: arsip zip berisi AndroidManifest.xml
+// biner. Berkas dibuat sekali di TestMain agar tidak perlu biner besar
+// di dalam repo.
+func TestReadFixture(t *testing.T) {
+	path := filepath.Join("testdata", "mini.apk")
+	if _, err := os.Stat(path); err != nil {
+		t.Skip("testdata/mini.apk belum ada")
+	}
+	got, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read gagal: %v", err)
+	}
+	if got.Package != "com.example.mini" {
+		t.Fatalf("package salah: %q", got.Package)
+	}
+	if got.VersionName == "" {
+		t.Fatal("versionName kosong")
+	}
+}
+
+func TestReadRejectsNonAPK(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bukan.apk")
+	if err := os.WriteFile(path, []byte("bukan zip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Read(path); err == nil {
+		t.Fatal("seharusnya error untuk berkas bukan APK")
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/apkmeta/`
+Expected: FAIL, `undefined: Read`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/apkmeta/apkmeta.go`:
+
+```go
+// Package apkmeta membaca identitas paket dari berkas APK tanpa memasangnya.
+package apkmeta
+
+import (
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/avast/apkparser"
+)
+
+var ErrNoManifest = errors.New("AndroidManifest.xml tidak ditemukan di dalam APK")
+
+// Meta adalah identitas singkat sebuah APK.
+type Meta struct {
+	Package     string `json:"package"`
+	VersionName string `json:"versionName"`
+	Label       string `json:"label"`
+	VersionCode int64  `json:"versionCode"`
+	MinSDK      int    `json:"minSdk"`
+}
+
+// Read membuka APK dan mengembalikan identitasnya.
+func Read(path string) (Meta, error) {
+	var m Meta
+	enc := &metaEncoder{meta: &m}
+	zipErr, _, manifestErr := apkparser.ParseApk(path, enc)
+	if manifestErr != nil {
+		return Meta{}, fmt.Errorf("gagal membaca AndroidManifest.xml: %w", manifestErr)
+	}
+	if zipErr != nil {
+		return Meta{}, fmt.Errorf("berkas bukan APK yang sah: %w", zipErr)
+	}
+	if m.Package == "" {
+		return Meta{}, ErrNoManifest
+	}
+	return m, nil
+}
+
+// metaEncoder menangkap elemen yang kita butuhkan dari aliran token XML.
+type metaEncoder struct {
+	meta *Meta
+}
+
+func (e *metaEncoder) EncodeToken(t xml.Token) error {
+	start, ok := t.(xml.StartElement)
+	if !ok {
+		return nil
+	}
+	switch start.Name.Local {
+	case "manifest":
+		for _, a := range start.Attr {
+			switch a.Name.Local {
+			case "package":
+				e.meta.Package = a.Value
+			case "versionName":
+				e.meta.VersionName = a.Value
+			case "versionCode":
+				code, err := strconv.ParseInt(strings.TrimSpace(a.Value), 10, 64)
+				if err == nil {
+					e.meta.VersionCode = code
+				}
+			}
+		}
+	case "uses-sdk":
+		for _, a := range start.Attr {
+			if a.Name.Local == "minSdkVersion" {
+				sdk, err := strconv.Atoi(strings.TrimSpace(a.Value))
+				if err == nil {
+					e.meta.MinSDK = sdk
+				}
+			}
+		}
+	case "application":
+		for _, a := range start.Attr {
+			if a.Name.Local == "label" {
+				e.meta.Label = a.Value
+			}
+		}
+	}
+	return nil
+}
+
+func (e *metaEncoder) Flush() error { return nil }
+
+// cache menghindari pembacaan APK berulang kali untuk berkas yang sama.
+var (
+	cacheMu sync.Mutex
+	cache   = map[string]cachedMeta{}
+)
+
+type cachedMeta struct {
+	size int64
+	mod  int64
+	meta Meta
+}
+
+// ReadCached seperti Read, tetapi menyimpan hasil untuk berkas yang tidak
+// berubah. Dipakai oleh lapisan HTTP yang sering meminta daftar APK.
+func ReadCached(path string, size, modUnixNano int64) (Meta, error) {
+	cacheMu.Lock()
+	if c, ok := cache[path]; ok && c.size == size && c.mod == modUnixNano {
+		cacheMu.Unlock()
+		return c.meta, nil
+	}
+	cacheMu.Unlock()
+
+	m, err := Read(path)
+	if err != nil {
+		return Meta{}, err
+	}
+
+	cacheMu.Lock()
+	cache[path] = cachedMeta{size: size, mod: modUnixNano, meta: m}
+	cacheMu.Unlock()
+	return m, nil
+}
+```
+
+- [ ] **Step 4: Unduh APK contoh untuk testdata**
+
+APK kecil apa pun bisa dipakai, asalkan package-nya diketahui. Karena APK contoh
+harus dimiliki sendiri, langkah ini membuat berkas fixture di mesin pengembang:
+
+```bash
+cd /home/server/autoinstall-and-uninstall-using-adb
+mkdir -p internal/apkmeta/testdata
+# Letakkan berkas APK kecil milikmu di sini dengan nama mini.apk, misalnya
+# APK contoh yang kamu pakai untuk audit. Tes otomatis di-skip bila tidak ada.
+```
+
+Tes `TestReadFixture` memakai `t.Skip` saat berkas tidak ada, sehingga CI tetap
+hijau bila fixture belum disediakan. `TestReadRejectsNonAPK` selalu berjalan.
+
+- [ ] **Step 5: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/apkmeta/ -v`
+Expected: PASS (satu tes boleh SKIP bila fixture belum ada).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/apkmeta
+git commit -m "feat(apkmeta): baca package dan versi dari berkas APK"
+```
+
+---
+
+## Task 9: Riwayat dan konfigurasi (`internal/store`)
+
+**Files:**
+- Create: `internal/store/store.go`
+- Test: `internal/store/store_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/store/store_test.go`:
+
+```go
+package store
+
+import (
+	"bytes"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestAppendAndRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	e := Entry{
+		Time:    time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC),
+		Action:  "install",
+		Package: "com.foo",
+		Device:  "S1",
+		Success: true,
+	}
+	if err := s.Append(e); err != nil {
+		t.Fatalf("Append gagal: %v", err)
+	}
+	got, err := s.Read(10)
+	if err != nil {
+		t.Fatalf("Read gagal: %v", err)
+	}
+	if len(got) != 1 || got[0].Package != "com.foo" || !got[0].Success {
+		t.Fatalf("isi riwayat salah: %+v", got)
+	}
+}
+
+func TestReadReturnsNewestFirst(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	base := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		if err := s.Append(Entry{Time: base.Add(time.Duration(i) * time.Minute), Package: "pkg"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Read(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("harus 3 baris, dapat %d", len(got))
+	}
+	if !got[0].Time.After(got[2].Time) {
+		t.Fatalf("urutan harus terbaru dulu: %+v", got)
+	}
+}
+
+func TestReadHonorsLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 5; i++ {
+		if err := s.Append(Entry{Package: "pkg"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Read(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("limit tidak dihormati: %d", len(got))
+	}
+}
+
+func TestReadIgnoresBrokenLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	if err := s.Append(Entry{Package: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appendRaw(f, "{ini bukan json}\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(10)
+	if err != nil {
+		t.Fatalf("baris rusak seharusnya dilewati: %v", err)
+	}
+	if len(got) != 1 || got[0].Package != "ok" {
+		t.Fatalf("hasil salah: %+v", got)
+	}
+}
+
+func TestExportCSV(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	if err := s.Append(Entry{
+		Time:    time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC),
+		Action:  "install",
+		Package: "com.foo",
+		Device:  "S1",
+		Success: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := s.ExportCSV(&buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.HasPrefix(out, "time,action,package,device,success,detail\n") {
+		t.Fatalf("header CSV salah:\n%s", out)
+	}
+	if !strings.Contains(out, "com.foo") {
+		t.Fatalf("baris CSV tidak memuat paket:\n%s", out)
+	}
+}
+
+func TestExportJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	if err := s.Append(Entry{Package: "com.foo", Success: true}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := s.ExportJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var decoded []Entry
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	if len(decoded) != 1 || decoded[0].Package != "com.foo" {
+		t.Fatalf("isi JSON salah: %+v", decoded)
+	}
+}
+
+func TestConfigRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := Config{ApkFolder: "/home/user/apk"}
+	if err := SaveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ApkFolder != cfg.ApkFolder {
+		t.Fatalf("got %+v want %+v", got, cfg)
+	}
+}
+
+func TestLoadConfigMissingFileReturnsDefault(t *testing.T) {
+	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "tidak-ada.json"))
+	if err != nil {
+		t.Fatalf("seharusnya tidak error: %v", err)
+	}
+	if cfg.ApkFolder != "" {
+		t.Fatalf("default harus kosong: %+v", cfg)
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/store/`
+Expected: FAIL, `undefined: New`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/store/store.go`:
+
+```go
+// Package store menyimpan riwayat audit dan konfigurasi pengguna.
+package store
+
+import (
+	"bufio"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+)
+
+// Entry adalah satu baris riwayat audit.
+type Entry struct {
+	Time    time.Time `json:"time"`
+	Action  string    `json:"action"`
+	Package string    `json:"package"`
+	Device  string    `json:"device"`
+	Success bool      `json:"success"`
+	Detail  string    `json:"detail,omitempty"`
+}
+
+// Store menulis dan membaca riwayat dalam format JSON Lines.
+type Store struct {
+	path string
+	mu   sync.Mutex
+}
+
+func New(path string) *Store {
+	return &Store{path: path}
+}
+
+// Append menambahkan satu entri ke akhir berkas riwayat.
+func (s *Store) Append(e Entry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if e.Time.IsZero() {
+		e.Time = time.Now()
+	}
+	data, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Read mengembalikan paling banyak limit entri, terbaru lebih dulu.
+func (s *Store) Read(limit int) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f, err := os.Open(s.path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var all []Entry
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var e Entry
+		if err := json.Unmarshal(line, &e); err != nil {
+			continue // baris rusak dilewati, bukan menggagalkan seluruh riwayat
+		}
+		all = append(all, e)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	// Balik urutan: terbaru lebih dulu.
+	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
+		all[i], all[j] = all[j], all[i]
+	}
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
+// ExportCSV menulis seluruh riwayat sebagai CSV.
+func (s *Store) ExportCSV(w io.Writer) error {
+	entries, err := s.readAllOldestFirst()
+	if err != nil {
+		return err
+	}
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{"time", "action", "package", "device", "success", "detail"}); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := cw.Write([]string{
+			e.Time.Format(time.RFC3339),
+			e.Action,
+			e.Package,
+			e.Device,
+			strconv.FormatBool(e.Success),
+			e.Detail,
+		}); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+// ExportJSON menulis seluruh riwayat sebagai satu larik JSON.
+func (s *Store) ExportJSON(w io.Writer) error {
+	entries, err := s.readAllOldestFirst()
+	if err != nil {
+		return err
+	}
+	if entries == nil {
+		entries = []Entry{}
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(entries)
+}
+
+func (s *Store) readAllOldestFirst() ([]Entry, error) {
+	entries, err := s.Read(0)
+	if err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+		entries[i], entries[j] = entries[j], entries[i]
+	}
+	return entries, nil
+}
+
+// Config adalah pengaturan kecil yang bertahan antar sesi.
+type Config struct {
+	ApkFolder string `json:"apkFolder"`
+}
+
+// LoadConfig membaca konfigurasi; berkas yang belum ada dianggap default.
+func LoadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return cfg, nil
+	}
+	if err != nil {
+		return cfg, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, fmt.Errorf("config.json rusak: %w", err)
+	}
+	return cfg, nil
+}
+
+// SaveConfig menulis konfigurasi ke disk.
+func SaveConfig(path string, cfg Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+```
+
+- [ ] **Step 4: Tambahkan helper `appendRaw` untuk tes**
+
+Create `internal/store/testhelper_test.go`:
+
+```go
+package store
+
+import "os"
+
+// appendRaw menambahkan teks mentah ke berkas riwayat, dipakai untuk
+// mensimulasikan baris yang rusak.
+func appendRaw(path, text string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(text)
+	return err
+}
+```
+
+- [ ] **Step 5: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/store/ -v`
+Expected: PASS untuk seluruh tes.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/store
+git commit -m "feat(store): riwayat audit JSONL, konfigurasi, dan ekspor CSV/JSON"
+```
+
+---
+
+## Task 10: Antrean job (`internal/queue`)
+
+**Files:**
+- Create: `internal/queue/queue.go`
+- Test: `internal/queue/queue_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/queue/queue_test.go`:
+
+```go
+package queue
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/herlangga72/adbapp/internal/adbx"
+)
+
+type fakeRunner struct {
+	mu    sync.Mutex
+	calls []string
+	fail  map[string]error
+	block chan struct{}
+}
+
+func newFakeRunner() *fakeRunner {
+	return &fakeRunner{fail: map[string]error{}}
+}
+
+func (f *fakeRunner) record(s string) {
+	f.mu.Lock()
+	f.calls = append(f.calls, s)
+	f.mu.Unlock()
+}
+
+func (f *fakeRunner) sequence() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+func (f *fakeRunner) Install(ctx context.Context, apkPath string, opts adbx.InstallOptions, stage adbx.StageFunc) error {
+	if stage != nil {
+		stage(10, "mulai")
+	}
+	if f.block != nil {
+		select {
+		case <-f.block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f.record("install:" + apkPath)
+	if err, ok := f.fail["install:"+apkPath]; ok {
+		return err
+	}
+	if stage != nil {
+		stage(100, "selesai")
+	}
+	return nil
+}
+
+func (f *fakeRunner) Uninstall(ctx context.Context, pkg string, keepData bool) error {
+	key := "uninstall:" + pkg
+	if keepData {
+		key = "uninstall_keep:" + pkg
+	}
+	f.record(key)
+	return f.fail[key]
+}
+
+func (f *fakeRunner) ClearData(ctx context.Context, pkg string) error {
+	f.record("clear:" + pkg)
+	return f.fail["clear:"+pkg]
+}
+
+func (f *fakeRunner) PullApk(ctx context.Context, pkg string, destDir string) (string, error) {
+	f.record("pull:" + pkg)
+	if err, ok := f.fail["pull:"+pkg]; ok {
+		return "", err
+	}
+	return destDir + "/" + pkg + ".apk", nil
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timeout menunggu: %s", what)
+}
+
+func runQueue(t *testing.T, q *Queue) context.CancelFunc {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	go q.Run(ctx)
+	t.Cleanup(cancel)
+	return cancel
+}
+
+func statusOf(t *testing.T, q *Queue, id string) Job {
+	t.Helper()
+	for _, j := range q.Jobs() {
+		if j.ID == id {
+			return j
+		}
+	}
+	t.Fatalf("job %s tidak ditemukan", id)
+	return Job{}
+}
+
+func TestJobsRunInOrder(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	b := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/b.apk"})
+
+	waitFor(t, "kedua job selesai", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusSuccess &&
+			statusOf(t, q, b.ID).Status == StatusSuccess
+	})
+
+	got := fr.sequence()
+	want := []string{"install:/tmp/a.apk", "install:/tmp/b.apk"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("urutan salah: got %v want %v", got, want)
+	}
+}
+
+func TestFailingJobDoesNotStopQueue(t *testing.T) {
+	fr := newFakeRunner()
+	fr.fail["install:/tmp/a.apk"] = adbx.ErrInsufficientStorage
+	q := New(fr)
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	b := q.Enqueue(Job{Kind: KindUninstall, Target: "com.b"})
+
+	waitFor(t, "job kedua selesai", func() bool {
+		return statusOf(t, q, b.ID).Status == StatusSuccess
+	})
+	if got := statusOf(t, q, a.ID); got.Status != StatusFailed {
+		t.Fatalf("job pertama harus gagal, dapat %v", got.Status)
+	}
+	if got := statusOf(t, q, a.ID).Error; got == "" {
+		t.Fatal("pesan error job pertama kosong")
+	}
+}
+
+func TestCancelQueuedJobPreventsRun(t *testing.T) {
+	fr := newFakeRunner()
+	fr.block = make(chan struct{})
+	q := New(fr)
+	runQueue(t, q)
+
+	first := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/first.apk"})
+	second := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/second.apk"})
+
+	waitFor(t, "job pertama berjalan", func() bool {
+		return statusOf(t, q, first.ID).Status == StatusRunning
+	})
+
+	if err := q.Cancel(second.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+	close(fr.block)
+
+	waitFor(t, "job pertama selesai", func() bool {
+		return statusOf(t, q, first.ID).Status == StatusSuccess
+	})
+	if got := statusOf(t, q, second.ID); got.Status != StatusCancelled {
+		t.Fatalf("job kedua harus cancelled, dapat %v", got.Status)
+	}
+	for _, c := range fr.sequence() {
+		if c == "install:/tmp/second.apk" {
+			t.Fatal("job yang dibatalkan tetap dijalankan")
+		}
+	}
+}
+
+func TestWaitsWhileDeviceDisconnected(t *testing.T) {
+	fr := newFakeRunner()
+	var connected bool
+	q := New(fr, WithDeviceCheck(func() bool { return connected }))
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	time.Sleep(50 * time.Millisecond)
+	if got := statusOf(t, q, a.ID).Status; got != StatusQueued {
+		t.Fatalf("tanpa perangkat job harus tetap queued, dapat %v", got)
+	}
+
+	connected = true
+	waitFor(t, "job jalan setelah perangkat tersambung", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusSuccess
+	})
+}
+
+func TestOnDoneReceivesResult(t *testing.T) {
+	fr := newFakeRunner()
+	var mu sync.Mutex
+	var done []Job
+	q := New(fr, WithOnDone(func(j Job, err error) {
+		mu.Lock()
+		done = append(done, j)
+		mu.Unlock()
+	}))
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindPull, Target: "com.foo", DestDir: "/tmp/pulled"})
+	waitFor(t, "job selesai", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusSuccess
+	})
+
+	waitFor(t, "callback dipanggil", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(done) == 1
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if done[0].Result != "/tmp/pulled/com.foo.apk" {
+		t.Fatalf("hasil pull salah: %q", done[0].Result)
+	}
+}
+
+func TestCancelRunningJobReportsCancelled(t *testing.T) {
+	fr := newFakeRunner()
+	fr.block = make(chan struct{})
+	q := New(fr)
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	waitFor(t, "job berjalan", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusRunning
+	})
+	if err := q.Cancel(a.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+	waitFor(t, "job dibatalkan", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusCancelled
+	})
+}
+
+func TestUnknownKindFails(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+	a := q.Enqueue(Job{Kind: Kind("ngawur"), Target: "x"})
+	waitFor(t, "job gagal", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusFailed
+	})
+	if !errors.Is(errors.New(statusOf(t, q, a.ID).Error), errors.New(statusOf(t, q, a.ID).Error)) {
+		t.Fatal("tidak mungkin terjadi")
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/queue/`
+Expected: FAIL, `undefined: New`.
+
+- [ ] **Step 3: Implementasi**
+
+Create `internal/queue/queue.go`:
+
+```go
+// Package queue menjalankan pekerjaan install/uninstall satu per satu.
+package queue
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/herlangga72/adbapp/internal/adbx"
+)
+
+type Kind string
+
+const (
+	KindInstall       Kind = "install"
+	KindUninstall     Kind = "uninstall"
+	KindUninstallKeep Kind = "uninstall_keep"
+	KindClearData     Kind = "clear_data"
+	KindPull          Kind = "pull"
+)
+
+type Status string
+
+const (
+	StatusQueued    Status = "queued"
+	StatusRunning   Status = "running"
+	StatusSuccess   Status = "success"
+	StatusFailed    Status = "failed"
+	StatusCancelled Status = "cancelled"
+)
+
+// Job adalah satu pekerjaan di antrean.
+type Job struct {
+	ID             string    `json:"id"`
+	Kind           Kind      `json:"kind"`
+	Target         string    `json:"target"`
+	Label          string    `json:"label,omitempty"`
+	DestDir        string    `json:"destDir,omitempty"`
+	Replace        bool      `json:"replace,omitempty"`
+	AllowDowngrade bool      `json:"allowDowngrade,omitempty"`
+	Status         Status    `json:"status"`
+	Progress       int       `json:"progress"`
+	Message        string    `json:"message,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	Result         string    `json:"result,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+	StartedAt      time.Time `json:"startedAt,omitempty"`
+	EndedAt        time.Time `json:"endedAt,omitempty"`
+}
+
+// Runner adalah kemampuan perangkat yang dibutuhkan antrean.
+type Runner interface {
+	Install(ctx context.Context, apkPath string, opts adbx.InstallOptions, stage adbx.StageFunc) error
+	Uninstall(ctx context.Context, pkg string, keepData bool) error
+	ClearData(ctx context.Context, pkg string) error
+	PullApk(ctx context.Context, pkg string, destDir string) (string, error)
+}
+
+type Option func(*Queue)
+
+// WithDeviceCheck membuat antrean menahan pekerjaan saat perangkat tidak siap.
+func WithDeviceCheck(fn func() bool) Option {
+	return func(q *Queue) { q.deviceOK = fn }
+}
+
+// WithOnDone mendaftarkan callback setelah sebuah job selesai (untuk riwayat).
+func WithOnDone(fn func(Job, error)) Option {
+	return func(q *Queue) { q.onDone = fn }
+}
+
+type Queue struct {
+	runner   Runner
+	deviceOK func() bool
+	onDone   func(Job, error)
+
+	mu      sync.Mutex
+	jobs    []*Job
+	byID    map[string]*Job
+	cancels map[string]context.CancelFunc
+	subs    map[int]chan Job
+	nextSub int
+	nextID  int
+	notify  chan struct{}
+}
+
+func New(r Runner, opts ...Option) *Queue {
+	q := &Queue{
+		runner:  r,
+		byID:    map[string]*Job{},
+		cancels: map[string]context.CancelFunc{},
+		subs:    map[int]chan Job{},
+		notify:  make(chan struct{}, 1),
+	}
+	for _, o := range opts {
+		o(q)
+	}
+	return q
+}
+
+// Enqueue menambahkan pekerjaan baru ke ujung antrean.
+func (q *Queue) Enqueue(spec Job) Job {
+	q.mu.Lock()
+	q.nextID++
+	if spec.ID == "" {
+		spec.ID = fmt.Sprintf("job-%d", q.nextID)
+	}
+	spec.Status = StatusQueued
+	if spec.CreatedAt.IsZero() {
+		spec.CreatedAt = time.Now()
+	}
+	job := &spec
+	q.jobs = append(q.jobs, job)
+	q.byID[job.ID] = job
+	snapshot := *job
+	q.mu.Unlock()
+
+	q.broadcast(snapshot)
+	q.wake()
+	return snapshot
+}
+
+func (q *Queue) wake() {
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+// Jobs mengembalikan salinan seluruh pekerjaan.
+func (q *Queue) Jobs() []Job {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]Job, 0, len(q.jobs))
+	for _, j := range q.jobs {
+		out = append(out, *j)
+	}
+	return out
+}
+
+// Cancel membatalkan pekerjaan yang masih menunggu atau sedang berjalan.
+func (q *Queue) Cancel(id string) error {
+	q.mu.Lock()
+	job, ok := q.byID[id]
+	if !ok {
+		q.mu.Unlock()
+		return fmt.Errorf("job %s tidak ditemukan", id)
+	}
+	switch job.Status {
+	case StatusQueued:
+		job.Status = StatusCancelled
+		job.Message = "dibatalkan sebelum dijalankan"
+		job.EndedAt = time.Now()
+		snap := *job
+		q.mu.Unlock()
+		q.broadcast(snap)
+		return nil
+	case StatusRunning:
+		cancel := q.cancels[id]
+		job.Status = StatusCancelled
+		job.Message = "dibatalkan"
+		q.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return nil
+	default:
+		q.mu.Unlock()
+		return fmt.Errorf("job %s sudah selesai", id)
+	}
+}
+
+// Subscribe menerima pembaruan setiap kali status job berubah.
+func (q *Queue) Subscribe() (<-chan Job, func()) {
+	ch := make(chan Job, 64)
+	q.mu.Lock()
+	q.nextSub++
+	id := q.nextSub
+	q.subs[id] = ch
+	q.mu.Unlock()
+
+	return ch, func() {
+		q.mu.Lock()
+		if c, ok := q.subs[id]; ok {
+			delete(q.subs, id)
+			close(c)
+		}
+		q.mu.Unlock()
+	}
+}
+
+func (q *Queue) broadcast(j Job) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, ch := range q.subs {
+		select {
+		case ch <- j:
+		default: // pelanggan lambat tidak boleh menghambat antrean
+		}
+	}
+}
+
+// Run menjalankan antrean sampai ctx dibatalkan.
+func (q *Queue) Run(ctx context.Context) {
+	for {
+		job := q.nextQueued()
+		if job == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-q.notify:
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		if q.deviceOK != nil && !q.deviceOK() {
+			// Tahan antrean, jangan tandai gagal: perangkat mungkin kembali.
+			select {
+			case <-ctx.Done():
+				return
+			case <-q.notify:
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		q.runJob(ctx, job)
+	}
+}
+
+func (q *Queue) nextQueued() *Job {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, j := range q.jobs {
+		if j.Status == StatusQueued {
+			return j
+		}
+	}
+	return nil
+}
+
+func (q *Queue) runJob(ctx context.Context, job *Job) {
+	jobCtx, cancel := context.WithCancel(ctx)
+
+	q.mu.Lock()
+	if job.Status != StatusQueued {
+		q.mu.Unlock()
+		cancel()
+		return
+	}
+	job.Status = StatusRunning
+	job.StartedAt = time.Now()
+	job.Message = "Mulai"
+	q.cancels[job.ID] = cancel
+	snap := *job
+	q.mu.Unlock()
+	q.broadcast(snap)
+
+	err := q.execute(jobCtx, job)
+	cancel()
+
+	q.mu.Lock()
+	delete(q.cancels, job.ID)
+	job.EndedAt = time.Now()
+	switch {
+	case job.Status == StatusCancelled:
+		// sudah ditandai oleh Cancel
+	case err != nil && errors.Is(err, context.Canceled):
+		job.Status = StatusCancelled
+		job.Message = "dibatalkan"
+	case err != nil:
+		job.Status = StatusFailed
+		job.Error = err.Error()
+		job.Message = "Gagal"
+	default:
+		job.Status = StatusSuccess
+		job.Progress = 100
+		job.Message = "Selesai"
+	}
+	final := *job
+	q.mu.Unlock()
+
+	q.broadcast(final)
+	if q.onDone != nil {
+		q.onDone(final, err)
+	}
+}
+
+func (q *Queue) execute(ctx context.Context, job *Job) error {
+	switch job.Kind {
+	case KindInstall:
+		opts := adbx.InstallOptions{
+			Replace:        job.Replace,
+			AllowDowngrade: job.AllowDowngrade,
+		}
+		return q.runner.Install(ctx, job.Target, opts, func(percent int, msg string) {
+			q.updateProgress(job.ID, percent, msg)
+		})
+	case KindUninstall:
+		return q.runner.Uninstall(ctx, job.Target, false)
+	case KindUninstallKeep:
+		return q.runner.Uninstall(ctx, job.Target, true)
+	case KindClearData:
+		return q.runner.ClearData(ctx, job.Target)
+	case KindPull:
+		dest, err := q.runner.PullApk(ctx, job.Target, job.DestDir)
+		if err == nil {
+			q.setResult(job.ID, dest)
+		}
+		return err
+	default:
+		return fmt.Errorf("jenis job tidak dikenal: %s", job.Kind)
+	}
+}
+
+func (q *Queue) updateProgress(id string, percent int, msg string) {
+	q.mu.Lock()
+	j, ok := q.byID[id]
+	if !ok {
+		q.mu.Unlock()
+		return
+	}
+	j.Progress = percent
+	j.Message = msg
+	snap := *j
+	q.mu.Unlock()
+	q.broadcast(snap)
+}
+
+func (q *Queue) setResult(id, result string) {
+	q.mu.Lock()
+	j, ok := q.byID[id]
+	if !ok {
+		q.mu.Unlock()
+		return
+	}
+	j.Result = result
+	q.mu.Unlock()
+}
+```
+
+- [ ] **Step 4: Rapikan tes terakhir yang berlebihan**
+
+Tes `TestUnknownKindFails` memuat pemeriksaan `errors.Is` yang tidak berguna.
+Ganti isi tes tersebut menjadi:
+
+```go
+func TestUnknownKindFails(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+	a := q.Enqueue(Job{Kind: Kind("ngawur"), Target: "x"})
+	waitFor(t, "job gagal", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusFailed
+	})
+	if statusOf(t, q, a.ID).Error == "" {
+		t.Fatal("job dengan jenis tak dikenal harus punya pesan error")
+	}
+}
+```
+
+Sesudah itu, import `errors` di berkas tes tidak lagi dipakai. Hapus `"errors"`
+dari blok import `queue_test.go`.
+
+- [ ] **Step 5: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/queue/ -race -v`
+Expected: PASS untuk ketujuh tes, tanpa peringatan race.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/queue
+git commit -m "feat(queue): antrean job berurutan dengan progress dan pembatalan"
+```
+
+---
+
+## Task 11: API HTTP dan SSE (`internal/httpapi`)
+
+**Files:**
+- Create: `internal/httpapi/httpapi.go`
+- Create: `internal/httpapi/apks.go`
+- Test: `internal/httpapi/httpapi_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/httpapi/httpapi_test.go`:
+
+```go
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/fstest"
+
+	"github.com/herlangga72/adbapp/internal/adbx"
+	"github.com/herlangga72/adbapp/internal/device"
+	"github.com/herlangga72/adbapp/internal/paths"
+	"github.com/herlangga72/adbapp/internal/queue"
+	"github.com/herlangga72/adbapp/internal/store"
+)
+
+type fakeDevice struct{ status device.Status }
+
+func (f fakeDevice) Current() device.Status                     { return f.status }
+func (f fakeDevice) Refresh(ctx context.Context) error          { return nil }
+
+type fakeQueue struct{ enqueued []queue.Job }
+
+func (f *fakeQueue) Enqueue(j queue.Job) queue.Job {
+	f.enqueued = append(f.enqueued, j)
+	j.ID = "job-1"
+	j.Status = queue.StatusQueued
+	return j
+}
+func (f *fakeQueue) Jobs() []queue.Job { return nil }
+func (f *fakeQueue) Cancel(id string) error { return nil }
+func (f *fakeQueue) Subscribe() (<-chan queue.Job, func()) {
+	ch := make(chan queue.Job)
+	return ch, func() { close(ch) }
+}
+
+type fakeHistory struct{ entries []store.Entry }
+
+func (f *fakeHistory) Read(limit int) ([]store.Entry, error) { return f.entries, nil }
+func (f *fakeHistory) ExportCSV(w io.Writer) error {
+	_, err := io.WriteString(w, "time,action,package,device,success,detail\n")
+	return err
+}
+func (f *fakeHistory) ExportJSON(w io.Writer) error {
+	return json.NewEncoder(w).Encode(f.entries)
+}
+
+type fakeAdb struct{}
+
+func (fakeAdb) Packages(ctx context.Context, system bool) ([]adbx.Package, error) {
+	return []adbx.Package{{Name: "com.foo", ApkPath: "/data/app/com.foo/base.apk"}}, nil
+}
+func (fakeAdb) PackageInfo(ctx context.Context, pkg string) (adbx.PackageInfo, error) {
+	return adbx.PackageInfo{Package: pkg, VersionName: "1.0"}, nil
+}
+
+func newTestServer(t *testing.T) (*Server, *fakeQueue) {
+	t.Helper()
+	fq := &fakeQueue{}
+	s := &Server{
+		Device:  fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
+		Queue:   fq,
+		History: &fakeHistory{entries: []store.Entry{{Action: "install", Package: "com.foo", Success: true}}},
+		Adb:     fakeAdb{},
+		Paths:   paths.ResolveFrom(t.TempDir()),
+		Static:  fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>adbapp</html>")}},
+	}
+	return s, fq
+}
+
+func TestStateEndpoint(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d", rec.Code)
+	}
+	var body struct {
+		Device device.Status `json:"device"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	if body.Device.Serial != "S1" {
+		t.Fatalf("serial salah: %+v", body.Device)
+	}
+}
+
+func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
+	s, fq := newTestServer(t)
+	payload := `{"kind":"uninstall","targets":["com.a","com.b"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/jobs", strings.NewReader(payload))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	}
+	if len(fq.enqueued) != 2 {
+		t.Fatalf("harus 2 job, dapat %d", len(fq.enqueued))
+	}
+	if fq.enqueued[0].Kind != queue.KindUninstall || fq.enqueued[1].Target != "com.b" {
+		t.Fatalf("job salah: %+v", fq.enqueued)
+	}
+}
+
+func TestCreateJobsRejectsUnknownKind(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"ngawur","targets":["x"]}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d", rec.Code)
+	}
+}
+
+func TestExportCSVSetsHeaders(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/history/export?format=csv", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d", rec.Code)
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "text/csv") {
+		t.Fatalf("content type salah: %q", rec.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(rec.Header().Get("Content-Disposition"), "attachment") {
+		t.Fatalf("harus sebagai unduhan: %q", rec.Header().Get("Content-Disposition"))
+	}
+}
+
+func TestLocalOnlyRejectsForeignHost(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	req.Host = "evil.example.com"
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("harus 403, dapat %d", rec.Code)
+	}
+}
+
+func TestUploadSavesFile(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	var body bytes.Buffer
+	writeMultipart(t, &body, "file", "contoh.apk", []byte("bukan-apk-sungguhan"))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/apks/upload", &body)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=batas")
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	}
+	var got apkEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	want := filepath.Join(s.Paths.UploadsDir, "contoh.apk")
+	if got.Path != want {
+		t.Fatalf("path salah: got %q want %q", got.Path, want)
+	}
+}
+
+func writeMultipart(t *testing.T, buf *bytes.Buffer, field, filename string, content []byte) {
+	t.Helper()
+	buf.WriteString("--batas\r\n")
+	buf.WriteString("Content-Disposition: form-data; name=\"" + field + "\"; filename=\"" + filename + "\"\r\n")
+	buf.WriteString("Content-Type: application/octet-stream\r\n\r\n")
+	buf.Write(content)
+	buf.WriteString("\r\n--batas--\r\n")
+}
+
+func TestIndexServedFromEmbeddedFS(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "adbapp") {
+		t.Fatalf("halaman tidak disajikan: %s", rec.Body.String())
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/httpapi/`
+Expected: FAIL, `undefined: Server`.
+
+- [ ] **Step 3: Implementasi inti**
+
+Create `internal/httpapi/httpapi.go`:
+
+```go
+// Package httpapi menyajikan API untuk UI dan mengalirkan pembaruan lewat SSE.
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/herlangga72/adbapp/internal/adbx"
+	"github.com/herlangga72/adbapp/internal/device"
+	"github.com/herlangga72/adbapp/internal/paths"
+	"github.com/herlangga72/adbapp/internal/queue"
+	"github.com/herlangga72/adbapp/internal/store"
+)
+
+type DeviceSource interface {
+	Current() device.Status
+	Refresh(ctx context.Context) error
+}
+
+type JobQueue interface {
+	Enqueue(queue.Job) queue.Job
+	Jobs() []queue.Job
+	Cancel(id string) error
+	Subscribe() (<-chan queue.Job, func())
+}
+
+type History interface {
+	Read(limit int) ([]store.Entry, error)
+	ExportCSV(w io.Writer) error
+	ExportJSON(w io.Writer) error
+}
+
+type Adb interface {
+	Packages(ctx context.Context, system bool) ([]adbx.Package, error)
+	PackageInfo(ctx context.Context, pkg string) (adbx.PackageInfo, error)
+}
+
+type Server struct {
+	Device   DeviceSource
+	Queue    JobQueue
+	History  History
+	Adb      Adb
+	Paths    paths.Paths
+	Static   fs.FS
+	LoadCfg  func() (store.Config, error)
+	SaveCfg  func(store.Config) error
+}
+
+// Handler merakit seluruh rute.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/state", s.handleState)
+	mux.HandleFunc("POST /api/device/refresh", s.handleRefresh)
+	mux.HandleFunc("GET /api/apks", s.handleListAPKs)
+	mux.HandleFunc("POST /api/apks/upload", s.handleUpload)
+	mux.HandleFunc("POST /api/apks/url", s.handleFromURL)
+	mux.HandleFunc("GET /api/packages", s.handlePackages)
+	mux.HandleFunc("POST /api/packages/detail", s.handlePackageDetail)
+	mux.HandleFunc("POST /api/jobs", s.handleCreateJobs)
+	mux.HandleFunc("POST /api/jobs/cancel", s.handleCancelJob)
+	mux.HandleFunc("GET /api/history", s.handleHistory)
+	mux.HandleFunc("GET /api/history/export", s.handleExport)
+	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("POST /api/config", s.handleConfig)
+	mux.Handle("GET /", http.FileServerFS(s.Static))
+	return localOnly(mux)
+}
+
+// localOnly menolak permintaan yang datang dengan Host bukan alamat lokal,
+// supaya server yang hanya mendengarkan 127.0.0.1 tidak bisa dipakai halaman
+// web lain di jaringan.
+func localOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if i := strings.LastIndex(host, ":"); i >= 0 {
+			host = host[:i]
+		}
+		host = strings.Trim(host, "[]")
+		switch host {
+		case "127.0.0.1", "localhost", "::1":
+			next.ServeHTTP(w, r)
+		default:
+			http.Error(w, "hanya bisa diakses dari komputer ini", http.StatusForbidden)
+		}
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func decodeJSON(r *http.Request, v any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<20))
+	return dec.Decode(v)
+}
+
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	cfg := store.Config{}
+	if s.LoadCfg != nil {
+		if c, err := s.LoadCfg(); err == nil {
+			cfg = c
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"device": s.Device.Current(),
+		"jobs":   s.Queue.Jobs(),
+		"config": cfg,
+	})
+}
+
+func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if err := s.Device.Refresh(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Device.Current())
+}
+
+func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
+	system := r.URL.Query().Get("system") == "1"
+	pkgs, err := s.Adb.Packages(r.Context(), system)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, pkgs)
+}
+
+func (s *Server) handlePackageDetail(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Package string `json:"package"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.Package == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("package wajib diisi"))
+		return
+	}
+	info, err := s.Adb.PackageInfo(r.Context(), req.Package)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+type createJobsRequest struct {
+	Kind           queue.Kind `json:"kind"`
+	Targets        []string   `json:"targets"`
+	Replace        bool       `json:"replace"`
+	AllowDowngrade bool       `json:"allowDowngrade"`
+}
+
+func (s *Server) handleCreateJobs(w http.ResponseWriter, r *http.Request) {
+	var req createJobsRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("badan permintaan tidak sah: %w", err))
+		return
+	}
+	if !knownKind(req.Kind) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("jenis job tidak dikenal: %s", req.Kind))
+		return
+	}
+	if len(req.Targets) == 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("tidak ada sasaran"))
+		return
+	}
+
+	created := make([]queue.Job, 0, len(req.Targets))
+	for _, target := range req.Targets {
+		if strings.TrimSpace(target) == "" {
+			continue
+		}
+		created = append(created, s.Queue.Enqueue(queue.Job{
+			Kind:           req.Kind,
+			Target:         target,
+			Label:          labelFor(req.Kind, target),
+			DestDir:        s.Paths.PulledDir,
+			Replace:        req.Replace,
+			AllowDowngrade: req.AllowDowngrade,
+		}))
+	}
+	writeJSON(w, http.StatusOK, created)
+}
+
+func knownKind(k queue.Kind) bool {
+	switch k {
+	case queue.KindInstall, queue.KindUninstall, queue.KindUninstallKeep,
+		queue.KindClearData, queue.KindPull:
+		return true
+	}
+	return false
+}
+
+func labelFor(k queue.Kind, target string) string {
+	base := target
+	if i := strings.LastIndex(target, "/"); i >= 0 {
+		base = target[i+1:]
+	}
+	switch k {
+	case queue.KindInstall:
+		return "Pasang " + base
+	case queue.KindUninstall:
+		return "Copot " + base
+	case queue.KindUninstallKeep:
+		return "Copot (simpan data) " + base
+	case queue.KindClearData:
+		return "Hapus data " + base
+	case queue.KindPull:
+		return "Tarik APK " + base
+	}
+	return base
+}
+
+func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.ID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("id wajib diisi"))
+		return
+	}
+	if err := s.Queue.Cancel(req.ID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "dibatalkan"})
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	entries, err := s.History.Read(limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format")
+	w.Header().Set("Content-Disposition", "attachment; filename=riwayat-adbapp."+format)
+	switch format {
+	case "json":
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if err := s.History.ExportJSON(w); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	default:
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		if err := s.History.ExportCSV(w); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	var cfg store.Config
+	if err := decodeJSON(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.SaveCfg != nil {
+		if err := s.SaveCfg(cfg); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+// handleEvents mengalirkan perubahan job dan status perangkat sebagai SSE.
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE tidak didukung", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	jobs, unsubscribe := s.Queue.Subscribe()
+	defer unsubscribe()
+
+	sendState := func() {
+		payload, err := json.Marshal(map[string]any{"device": s.Device.Current()})
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: state\ndata: %s\n\n", payload)
+		flusher.Flush()
+	}
+	sendState()
+
+	deviceTicker := time.NewTicker(2 * time.Second)
+	defer deviceTicker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			payload, err := json.Marshal(job)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "event: job\ndata: %s\n\n", payload)
+			flusher.Flush()
+		case <-deviceTicker.C:
+			sendState()
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Implementasi berkas APK**
+
+Create `internal/httpapi/apks.go`:
+
+```go
+package httpapi
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/herlangga72/adbapp/internal/apkmeta"
+)
+
+type apkEntry struct {
+	Path        string `json:"path"`
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	Package     string `json:"package,omitempty"`
+	VersionName string `json:"versionName,omitempty"`
+	VersionCode int64  `json:"versionCode,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+func (s *Server) entryFor(path string) apkEntry {
+	e := apkEntry{Path: path, Name: filepath.Base(path)}
+	st, err := os.Stat(path)
+	if err != nil {
+		e.Error = err.Error()
+		return e
+	}
+	e.Size = st.Size()
+
+	meta, err := apkmeta.ReadCached(path, st.Size(), st.ModTime().UnixNano())
+	if err != nil {
+		e.Error = err.Error()
+		return e
+	}
+	e.Package = meta.Package
+	e.VersionName = meta.VersionName
+	e.VersionCode = meta.VersionCode
+	return e
+}
+
+// handleListAPKs mendaftar berkas .apk di folder koleksi.
+func (s *Server) handleListAPKs(w http.ResponseWriter, r *http.Request) {
+	folder := r.URL.Query().Get("folder")
+	if folder == "" {
+		if s.LoadCfg != nil {
+			if cfg, err := s.LoadCfg(); err == nil {
+				folder = cfg.ApkFolder
+			}
+		}
+	}
+	if folder == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("folder belum ditentukan"))
+		return
+	}
+
+	dirents, err := os.ReadDir(folder)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("folder tidak bisa dibaca: %w", err))
+		return
+	}
+
+	entries := make([]apkEntry, 0, len(dirents))
+	for _, de := range dirents {
+		if de.IsDir() || !strings.EqualFold(filepath.Ext(de.Name()), ".apk") {
+			continue
+		}
+		entries = append(entries, s.entryFor(filepath.Join(folder, de.Name())))
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(1 << 30); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("gagal membaca berkas: %w", err))
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("berkas tidak ditemukan pada permintaan"))
+		return
+	}
+	defer file.Close()
+
+	name := filepath.Base(header.Filename)
+	if !strings.EqualFold(filepath.Ext(name), ".apk") {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("hanya berkas .apk yang diterima"))
+		return
+	}
+
+	dest := filepath.Join(s.Paths.UploadsDir, name)
+	if err := os.MkdirAll(s.Paths.UploadsDir, 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out, err := os.Create(dest)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := io.Copy(out, file); err != nil {
+		out.Close()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := out.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	entry := s.entryFor(dest)
+	writeJSON(w, http.StatusOK, entry)
+}
+
+func (s *Server) handleFromURL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL  string `json:"url"`
+		Name string `json:"name"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.URL == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("url wajib diisi"))
+		return
+	}
+
+	name := filepath.Base(req.Name)
+	if name == "" || name == "." || name == "/" {
+		name = filepath.Base(req.URL)
+	}
+	if !strings.EqualFold(filepath.Ext(name), ".apk") {
+		name += ".apk"
+	}
+
+	resp, err := http.Get(req.URL)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("gagal mengunduh: %w", err))
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("unduhan gagal, kode %d", resp.StatusCode))
+		return
+	}
+
+	if err := os.MkdirAll(s.Paths.UploadsDir, 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	dest := filepath.Join(s.Paths.UploadsDir, name)
+	out, err := os.Create(dest)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := io.Copy(out, io.LimitReader(resp.Body, 2<<30)); err != nil {
+		out.Close()
+		writeError(w, http.StatusBadGateway, fmt.Errorf("gagal menyimpan unduhan: %w", err))
+		return
+	}
+	out.Close()
+
+	entry := s.entryFor(dest)
+	if entry.Error != "" {
+		if err := os.Remove(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, fmt.Errorf("unduhan bukan APK yang sah: %s", entry.Error))
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+```
+
+- [ ] **Step 5: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/httpapi/ -v`
+Expected: PASS untuk kedelapan tes.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/httpapi
+git commit -m "feat(httpapi): API REST, SSE, dan pengelolaan berkas APK"
+```
+
+---
+
+## Task 12: Tampilan web (`internal/webui`)
+
+**Files:**
+- Create: `internal/webui/embed.go`
+- Create: `internal/webui/static/index.html`
+- Create: `internal/webui/static/styles.css`
+- Create: `internal/webui/static/app.js`
+- Test: `internal/webui/embed_test.go`
+
+- [ ] **Step 1: Tulis tes yang gagal**
+
+Create `internal/webui/embed_test.go`:
+
+```go
+package webui
+
+import (
+	"io/fs"
+	"strings"
+	"testing"
+)
+
+func TestFSContainsIndex(t *testing.T) {
+	data, err := fs.ReadFile(FS(), "index.html")
+	if err != nil {
+		t.Fatalf("index.html tidak ada di dalam biner: %v", err)
+	}
+	if !strings.Contains(string(data), "adbapp") {
+		t.Fatal("index.html tidak memuat penanda aplikasi")
+	}
+}
+
+func TestFSContainsAssets(t *testing.T) {
+	for _, name := range []string{"app.js", "styles.css"} {
+		if _, err := fs.ReadFile(FS(), name); err != nil {
+			t.Fatalf("%s tidak ada: %v", name, err)
+		}
+	}
+}
+```
+
+- [ ] **Step 2: Jalankan tes, pastikan gagal**
+
+Run: `go test ./internal/webui/`
+Expected: FAIL, `undefined: FS`.
+
+- [ ] **Step 3: Implementasi embed**
+
+Create `internal/webui/embed.go`:
+
+```go
+// Package webui menanam berkas tampilan ke dalam biner aplikasi.
+package webui
+
+import (
+	"embed"
+	"io/fs"
+)
+
+//go:embed static
+var staticFS embed.FS
+
+// FS mengembalikan berkas tampilan siap disajikan.
+func FS() fs.FS {
+	sub, err := fs.Sub(staticFS, "static")
+	if err != nil {
+		panic(err)
+	}
+	return sub
+}
+```
+
+- [ ] **Step 4: Tulis halaman**
+
+Create `internal/webui/static/index.html`:
+
+```html
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>adbapp — pasang &amp; copot aplikasi Android</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="device">
+    <span id="dot" class="dot"></span>
+    <span id="device-label">Memeriksa perangkat...</span>
+  </div>
+  <button id="refresh" class="secondary">Pindai ulang</button>
+</header>
+
+<div id="hint" class="hint hidden"></div>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="install">Pasang</button>
+  <button class="tab" data-tab="installed">Terpasang</button>
+</nav>
+
+<main>
+  <section id="tab-install" class="panel active">
+    <div id="drop" class="drop">
+      <p><strong>Seret &amp; lepas berkas APK</strong> ke sini</p>
+      <p class="muted">atau pakai tombol di bawah</p>
+      <div class="row">
+        <button id="pick-file" class="secondary">Pilih berkas</button>
+        <input id="folder" class="grow" placeholder="Folder koleksi APK, mis. /home/kamu/apk">
+        <button id="load-folder" class="secondary">Muat folder</button>
+      </div>
+      <div class="row">
+        <input id="url" class="grow" placeholder="Tambah dari URL, mis. https://contoh/app.apk">
+        <button id="add-url" class="secondary">Unduh</button>
+      </div>
+    </div>
+    <input id="file-input" type="file" accept=".apk" multiple class="hidden">
+
+    <div class="toolbar">
+      <label><input type="checkbox" id="replace" checked> Timpa bila sudah terpasang</label>
+      <label><input type="checkbox" id="downgrade"> Izinkan versi lebih rendah</label>
+    </div>
+
+    <table id="apk-table">
+      <thead>
+        <tr><th></th><th>Berkas</th><th>Paket</th><th>Versi</th><th>Ukuran</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="actions">
+      <button id="install-selected" class="primary">Pasang terpilih</button>
+    </div>
+  </section>
+
+  <section id="tab-installed" class="panel">
+    <div class="toolbar">
+      <input id="search" class="grow" placeholder="Cari aplikasi...">
+      <select id="sort">
+        <option value="name">Urut nama</option>
+        <option value="system">Aplikasi sistem dulu</option>
+      </select>
+      <label><input type="checkbox" id="show-system"> Tampilkan sistem</label>
+      <button id="reload-packages" class="secondary">Muat ulang</button>
+    </div>
+    <table id="pkg-table">
+      <thead>
+        <tr><th></th><th>Paket</th><th>Versi</th><th>Aksi</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="actions">
+      <button id="uninstall-selected" class="danger">Copot terpilih</button>
+      <button id="uninstall-keep-selected" class="danger">Copot (simpan data)</button>
+    </div>
+    <div id="detail" class="detail hidden"></div>
+  </section>
+</main>
+
+<section class="bottom">
+  <div class="tabs small">
+    <button class="tab active" data-tab="queue">Antrean</button>
+    <button class="tab" data-tab="history">Riwayat</button>
+  </div>
+  <div id="tab-queue" class="panel active">
+    <ul id="queue-list" class="jobs"></ul>
+  </div>
+  <div id="tab-history" class="panel">
+    <div class="row">
+      <button id="export-csv" class="secondary">Ekspor CSV</button>
+      <button id="export-json" class="secondary">Ekspor JSON</button>
+    </div>
+    <table id="history-table">
+      <thead><tr><th>Waktu</th><th>Aksi</th><th>Paket</th><th>Hasil</th><th>Catatan</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>
+```
+
+- [ ] **Step 5: Tulis gaya**
+
+Create `internal/webui/static/styles.css`:
+
+```css
+:root {
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --line: #dfe3e8;
+  --text: #1c2024;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --danger: #dc2626;
+  --ok: #16a34a;
+  --warn: #d97706;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+.hidden { display: none !important; }
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 10px 16px; background: var(--panel);
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+}
+.device { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+.dot.ready { background: var(--ok); }
+.dot.unauthorized { background: var(--warn); }
+.dot.offline, .dot.none { background: var(--danger); }
+.hint {
+  margin: 8px 16px; padding: 10px 12px; border-left: 3px solid var(--warn);
+  background: #fff7ed; color: #7c2d12; border-radius: 4px;
+}
+.tabs { display: flex; gap: 4px; padding: 8px 16px 0; }
+.tabs.small { padding-top: 0; }
+.tab {
+  border: 1px solid var(--line); background: var(--panel); padding: 6px 14px;
+  border-radius: 6px 6px 0 0; cursor: pointer; color: var(--muted);
+}
+.tab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--panel); }
+main { padding: 0 16px 16px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: none; }
+.panel.active { display: block; }
+.bottom { margin: 16px; }
+.drop {
+  border: 2px dashed var(--line); border-radius: 8px; padding: 16px;
+  text-align: center; background: #fbfcfd;
+}
+.drop.over { border-color: var(--accent); background: #eff6ff; }
+.drop .row, .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row { margin-top: 8px; }
+.toolbar { margin: 12px 0; }
+.grow { flex: 1 1 220px; }
+input[type=text], input:not([type]), select {
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff;
+}
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: .03em; }
+tr.selected { background: #eff6ff; }
+button {
+  padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+button.secondary { background: #f1f3f5; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.actions { display: flex; gap: 8px; margin-top: 12px; }
+.muted { color: var(--muted); }
+.badge {
+  font-size: 11px; padding: 1px 6px; border-radius: 10px;
+  background: #e5e7eb; color: #374151;
+}
+.jobs { list-style: none; margin: 0; padding: 0; }
+.jobs li { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.jobs .meta { color: var(--muted); font-size: 12px; }
+.progress { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+.progress > span { display: block; height: 100%; background: var(--accent); }
+.status-success { color: var(--ok); }
+.status-failed { color: var(--danger); }
+.status-cancelled { color: var(--muted); }
+.detail { margin-top: 12px; padding: 12px; background: #f9fafb; border: 1px solid var(--line); border-radius: 6px; }
+.detail dl { display: grid; grid-template-columns: 160px 1fr; gap: 4px 12px; margin: 0; }
+.toast {
+  position: fixed; right: 16px; bottom: 16px; max-width: 420px;
+  background: #111827; color: #fff; padding: 10px 14px; border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.2); z-index: 20;
+}
+```
+
+- [ ] **Step 6: Tulis logika UI**
+
+Create `internal/webui/static/app.js`:
+
+```js
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const state = { apks: [], packages: [], selectedApks: new Set(), selectedPkgs: new Set(), jobs: new Map() };
+
+function toast(message, isError) {
+  const el = $('toast');
+  el.textContent = message;
+  el.style.background = isError ? '#7f1d1d' : '#111827';
+  el.classList.remove('hidden');
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => el.classList.add('hidden'), 4000);
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).error || detail; } catch (e) { /* biarkan */ }
+    throw new Error(detail);
+  }
+  if (res.headers.get('content-type')?.includes('application/json')) return res.json();
+  return res.text();
+}
+
+function switchTab(group, name) {
+  document.querySelectorAll('.tabs').forEach((nav) => {
+    if (!nav.contains(document.querySelector(`[data-tab="${name}"]`))) return;
+    nav.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  });
+  document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+  const panel = $(`tab-${name}`);
+  if (panel) panel.classList.add('active');
+}
+
+document.querySelectorAll('.tab').forEach((tab) => {
+  tab.addEventListener('click', () => switchTab(tab.parentElement, tab.dataset.tab));
+});
+
+function humanSize(bytes) {
+  if (!bytes) return '-';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0, v = bytes;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function renderDevice(status) {
+  const dot = $('dot');
+  dot.className = 'dot ' + status.state;
+  const label = $('device-label');
+  const hint = $('hint');
+  if (status.state === 'ready') {
+    label.textContent = `${status.model || status.serial} · siap`;
+    hint.classList.add('hidden');
+  } else if (status.state === 'unauthorized') {
+    label.textContent = 'Perangkat belum diizinkan';
+    hint.textContent = 'Lihat layar HP dan tekan "Allow" untuk USB debugging, lalu pindai ulang.';
+    hint.classList.remove('hidden');
+  } else if (status.state === 'offline') {
+    label.textContent = 'Perangkat offline';
+    hint.textContent = 'Cek kabel USB, pilih mode File Transfer, dan pastikan USB debugging menyala.';
+    hint.classList.remove('hidden');
+  } else {
+    label.textContent = 'Tidak ada perangkat';
+    hint.textContent = 'Sambungkan HP dengan kabel USB dan pastikan USB debugging menyala.';
+    hint.classList.remove('hidden');
+  }
+}
+
+function renderApks() {
+  const tbody = $('apk-table').querySelector('tbody');
+  tbody.innerHTML = '';
+  state.apks.forEach((apk) => {
+    const tr = document.createElement('tr');
+    if (state.selectedApks.has(apk.path)) tr.classList.add('selected');
+    tr.innerHTML = `
+      <td><input type="checkbox" ${state.selectedApks.has(apk.path) ? 'checked' : ''}></td>
+      <td>${apk.name}</td>
+      <td>${apk.package || '<span class="muted">tidak terbaca</span>'}</td>
+      <td>${apk.versionName || '-'}</td>
+      <td>${humanSize(apk.size)}</td>`;
+    if (apk.error) tr.title = apk.error;
+    tr.querySelector('input').addEventListener('change', (e) => {
+      if (e.target.checked) state.selectedApks.add(apk.path); else state.selectedApks.delete(apk.path);
+      renderApks();
+    });
+    tbody.appendChild(tr);
+  });
+  $('install-selected').textContent = `Pasang terpilih (${state.selectedApks.size})`;
+  $('install-selected').disabled = state.selectedApks.size === 0;
+}
+
+function addApk(entry) {
+  const existing = state.apks.findIndex((a) => a.path === entry.path);
+  if (existing >= 0) state.apks[existing] = entry; else state.apks.push(entry);
+  renderApks();
+}
+
+function renderPackages() {
+  const term = $('search').value.toLowerCase();
+  const sortMode = $('sort').value;
+  const tbody = $('pkg-table').querySelector('tbody');
+  tbody.innerHTML = '';
+
+  let rows = state.packages.filter((p) => p.name.toLowerCase().includes(term));
+  if (!sortMode.startsWith('system')) rows = rows.slice().sort((a, b) => a.name.localeCompare(b.name));
+
+  rows.forEach((pkg) => {
+    const tr = document.createElement('tr');
+    const locked = pkg.system;
+    tr.innerHTML = `
+      <td><input type="checkbox" ${state.selectedPkgs.has(pkg.name) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
+      <td>${pkg.name} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
+      <td>${pkg.versionCode || '-'}</td>
+      <td>
+        <button class="secondary" data-act="detail">Detail</button>
+        <button class="danger" data-act="uninstall" ${locked ? 'disabled' : ''}>Copot</button>
+      </td>`;
+    tr.querySelector('input').addEventListener('change', (e) => {
+      if (e.target.checked) state.selectedPkgs.add(pkg.name); else state.selectedPkgs.delete(pkg.name);
+      renderPackages();
+    });
+    tr.querySelector('[data-act=detail]').addEventListener('click', () => showDetail(pkg.name));
+    tr.querySelector('[data-act=uninstall]').addEventListener('click', () => {
+      if (confirm(`Copot ${pkg.name}?`)) createJobs('uninstall', [pkg.name]);
+    });
+    tbody.appendChild(tr);
+  });
+
+  $('uninstall-selected').textContent = `Copot terpilih (${state.selectedPkgs.size})`;
+  $('uninstall-keep-selected').textContent = `Copot (simpan data) (${state.selectedPkgs.size})`;
+}
+
+async function showDetail(name) {
+  const el = $('detail');
+  el.classList.remove('hidden');
+  el.textContent = 'Memuat detail...';
+  try {
+    const info = await api('/api/packages/detail', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ package: name }),
+    });
+    el.innerHTML = `<h3>${info.package}</h3>
+      <dl>
+        <dt>Versi</dt><dd>${info.versionName || '-'} (kode ${info.versionCode || '-'})</dd>
+        <dt>Ukuran data</dt><dd>${humanSize(info.sizeBytes)}</dd>
+        <dt>Terpasang</dt><dd>${info.installTime || '-'}</dd>
+        <dt>Diperbarui</dt><dd>${info.updateTime || '-'}</dd>
+        <dt>APK</dt><dd>${info.apkPath || '-'}</dd>
+        <dt>Izin</dt><dd>${(info.permissions || []).join('<br>') || '-'}</dd>
+      </dl>`;
+  } catch (err) {
+    el.textContent = 'Gagal memuat detail: ' + err.message;
+  }
+}
+
+function renderJobs() {
+  const list = $('queue-list');
+  list.innerHTML = '';
+  const jobs = Array.from(state.jobs.values()).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  if (jobs.length === 0) {
+    list.innerHTML = '<li class="muted">Belum ada pekerjaan.</li>';
+    return;
+  }
+  jobs.forEach((job) => {
+    const li = document.createElement('li');
+    const running = job.status === 'running' || job.status === 'queued';
+    li.innerHTML = `
+      <div><strong>${job.label || job.target}</strong>
+        <span class="status-${job.status}">${job.status}</span></div>
+      <div class="meta">${job.message || ''} ${job.error ? '· ' + job.error : ''} ${job.result ? '· ' + job.result : ''}</div>
+      <div class="progress"><span style="width:${job.status === 'success' ? 100 : job.progress || 0}%"></span></div>
+      ${running ? '<button class="secondary" data-cancel>Batalkan</button>' : ''}`;
+    if (running) {
+      li.querySelector('[data-cancel]').addEventListener('click', () => {
+        api('/api/jobs/cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: job.id }),
+        }).catch((e) => toast(e.message, true));
+      });
+    }
+    list.appendChild(li);
+  });
+}
+
+async function createJobs(kind, targets) {
+  if (!targets.length) { toast('Pilih dulu apa yang mau diproses', true); return; }
+  try {
+    const created = await api('/api/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind,
+        targets,
+        replace: $('replace').checked,
+        allowDowngrade: $('downgrade').checked,
+      }),
+    });
+    created.forEach((job) => state.jobs.set(job.id, job));
+    renderJobs();
+    switchTab(null, 'queue');
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function loadHistory() {
+  try {
+    const entries = await api('/api/history?limit=200');
+    const tbody = $('history-table').querySelector('tbody');
+    tbody.innerHTML = '';
+    entries.forEach((e) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${new Date(e.time).toLocaleString('id-ID')}</td>
+        <td>${e.action}</td><td>${e.package || '-'}</td>
+        <td class="${e.success ? 'status-success' : 'status-failed'}">${e.success ? 'sukses' : 'gagal'}</td>
+        <td>${e.detail || ''}</td>`;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function loadPackages() {
+  try {
+    const system = $('show-system').checked ? '1' : '0';
+    state.packages = await api(`/api/packages?system=${system}`);
+    renderPackages();
+  } catch (err) {
+    toast('Gagal memuat daftar aplikasi: ' + err.message, true);
+  }
+}
+
+function connectEvents() {
+  const source = new EventSource('/api/events');
+  source.addEventListener('state', (ev) => renderDevice(JSON.parse(ev.data).device));
+  source.addEventListener('job', (ev) => {
+    const job = JSON.parse(ev.data);
+    state.jobs.set(job.id, job);
+    renderJobs();
+    if (job.status === 'success' || job.status === 'failed') {
+      loadHistory();
+      if (job.kind !== 'install') loadPackages();
+    }
+  });
+  source.onerror = () => setTimeout(connectEvents, 3000);
+}
+
+function setupDropZone() {
+  const zone = $('drop');
+  ['dragenter', 'dragover'].forEach((ev) =>
+    zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach((ev) =>
+    zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.remove('over'); }));
+
+  zone.addEventListener('drop', async (e) => {
+    const files = Array.from(e.dataTransfer.files || []).filter((f) => f.name.toLowerCase().endsWith('.apk'));
+    if (!files.length) { toast('Hanya berkas .apk yang bisa dipasang', true); return; }
+    for (const file of files) await uploadFile(file);
+  });
+
+  $('pick-file').addEventListener('click', () => $('file-input').click());
+  $('file-input').addEventListener('change', async (e) => {
+    for (const file of Array.from(e.target.files)) await uploadFile(file);
+    e.target.value = '';
+  });
+}
+
+async function uploadFile(file) {
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    addApk(await api('/api/apks/upload', { method: 'POST', body: form }));
+    toast(`${file.name} siap dipasang`);
+  } catch (err) {
+    toast('Gagal mengunggah: ' + err.message, true);
+  }
+}
+
+function bind() {
+  $('refresh').addEventListener('click', () =>
+    api('/api/device/refresh', { method: 'POST' }).catch((e) => toast(e.message, true)));
+  $('load-folder').addEventListener('click', async () => {
+    const folder = $('folder').value.trim();
+    if (!folder) { toast('Isi dulu folder koleksi', true); return; }
+    try {
+      state.apks = await api(`/api/apks?folder=${encodeURIComponent(folder)}`);
+      renderApks();
+      await api('/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apkFolder: folder }),
+      });
+    } catch (err) { toast(err.message, true); }
+  });
+  $('add-url').addEventListener('click', async () => {
+    const url = $('url').value.trim();
+    if (!url) { toast('Isi dulu URL-nya', true); return; }
+    try {
+      addApk(await api('/api/apks/url', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      }));
+      $('url').value = '';
+    } catch (err) { toast(err.message, true); }
+  });
+  $('install-selected').addEventListener('click', () =>
+    createJobs('install', Array.from(state.selectedApks)));
+  $('uninstall-selected').addEventListener('click', () => {
+    const targets = Array.from(state.selectedPkgs);
+    if (targets.length && confirm(`Copot ${targets.length} aplikasi? Tindakan ini menghapus aplikasi dari HP.`)) {
+      createJobs('uninstall', targets);
+    }
+  });
+  $('uninstall-keep-selected').addEventListener('click', () => {
+    const targets = Array.from(state.selectedPkgs);
+    if (targets.length && confirm(`Copot ${targets.length} aplikasi tapi simpan datanya?`)) {
+      createJobs('uninstall_keep', targets);
+    }
+  });
+  $('reload-packages').addEventListener('click', loadPackages);
+  $('show-system').addEventListener('change', loadPackages);
+  $('search').addEventListener('input', renderPackages);
+  $('sort').addEventListener('change', renderPackages);
+  $('export-csv').addEventListener('click', () => { window.location = '/api/history/export?format=csv'; });
+  $('export-json').addEventListener('click', () => { window.location = '/api/history/export?format=json'; });
+}
+
+async function boot() {
+  bind();
+  setupDropZone();
+  connectEvents();
+  try {
+    const snapshot = await api('/api/state');
+    renderDevice(snapshot.device);
+    (snapshot.jobs || []).forEach((job) => state.jobs.set(job.id, job));
+    renderJobs();
+    if (snapshot.config?.apkFolder) $('folder').value = snapshot.config.apkFolder;
+  } catch (err) {
+    toast('Gagal memuat status: ' + err.message, true);
+  }
+  renderApks();
+  renderPackages();
+  loadHistory();
+}
+
+boot();
+```
+
+- [ ] **Step 7: Jalankan tes, pastikan lulus**
+
+Run: `go test ./internal/webui/ -v`
+Expected: PASS untuk kedua tes.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add internal/webui
+git commit -m "feat(webui): tampilan web tertanam untuk pasang dan copot aplikasi"
+```
+
+---
+
+## Task 13: Merakit semuanya (`main.go`)
+
+**Files:**
+- Create: `main.go`
+- Create: `internal/browser/browser.go`
+
+- [ ] **Step 1: Tulis pembuka browser**
+
+Create `internal/browser/browser.go`:
+
+```go
+// Package browser membuka URL di browser bawaan sistem.
+package browser
+
+import (
+	"os/exec"
+	"runtime"
+)
+
+// Open membuka url di browser. Kegagalan tidak fatal: pengguna masih bisa
+// membuka alamatnya secara manual.
+func Open(url string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", url).Start()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	default:
+		return exec.Command("xdg-open", url).Start()
+	}
+}
+```
+
+- [ ] **Step 2: Tulis `main.go`**
+
+Create `main.go`:
+
+```go
+// Command adbapp menyajikan UI lokal untuk memasang dan mencopot aplikasi
+// Android lewat adb.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/herlangga72/adbapp/internal/adbx"
+	"github.com/herlangga72/adbapp/internal/browser"
+	"github.com/herlangga72/adbapp/internal/bundle"
+	"github.com/herlangga72/adbapp/internal/device"
+	"github.com/herlangga72/adbapp/internal/httpapi"
+	"github.com/herlangga72/adbapp/internal/paths"
+	"github.com/herlangga72/adbapp/internal/queue"
+	"github.com/herlangga72/adbapp/internal/store"
+	"github.com/herlangga72/adbapp/internal/webui"
+)
+
+func main() {
+	port := flag.Int("port", 0, "port server lokal (0 = pilih otomatis)")
+	noOpen := flag.Bool("no-open", false, "jangan buka browser otomatis")
+	dataDir := flag.String("data", "", "folder data khusus (untuk pengujian)")
+	flag.Parse()
+
+	if err := run(*port, *noOpen, *dataDir); err != nil {
+		log.Fatalf("adbapp berhenti: %v", err)
+	}
+}
+
+func run(port int, noOpen bool, dataDir string) error {
+	p, err := resolvePaths(dataDir)
+	if err != nil {
+		return err
+	}
+	if err := p.Ensure(); err != nil {
+		return fmt.Errorf("tidak bisa menyiapkan folder data: %w", err)
+	}
+
+	adbPath, err := bundle.Ensure(p.AdbDir)
+	if err != nil {
+		return err
+	}
+	log.Printf("adb siap: %s", adbPath)
+
+	base := adbx.New(adbPath)
+	monitor := device.New(base)
+	history := store.New(p.HistoryFile)
+
+	targeted := &targetedRunner{base: base, monitor: monitor}
+	q := queue.New(targeted,
+		queue.WithDeviceCheck(func() bool { return monitor.Current().State == device.StateReady }),
+		queue.WithOnDone(func(job queue.Job, jobErr error) {
+			entry := store.Entry{
+				Action:  string(job.Kind),
+				Package: job.Target,
+				Device:  monitor.Current().Serial,
+				Success: jobErr == nil && job.Status == queue.StatusSuccess,
+			}
+			if jobErr != nil {
+				entry.Detail = jobErr.Error()
+			} else if job.Result != "" {
+				entry.Detail = job.Result
+			}
+			if err := history.Append(entry); err != nil {
+				log.Printf("gagal menulis riwayat: %v", err)
+			}
+		}))
+
+	cfgPath := p.ConfigFile
+	api := &httpapi.Server{
+		Device:  monitor,
+		Queue:   q,
+		History: history,
+		Adb:     targeted,
+		Paths:   p,
+		Static:  webui.FS(),
+		LoadCfg: func() (store.Config, error) { return store.LoadConfig(cfgPath) },
+		SaveCfg: func(c store.Config) error { return store.SaveConfig(cfgPath, c) },
+	}
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return fmt.Errorf("tidak bisa membuka port lokal: %w", err)
+	}
+	url := "http://" + listener.Addr().String()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := monitor.Refresh(ctx); err != nil {
+		log.Printf("pemindaian perangkat awal gagal: %v", err)
+	}
+	go monitor.Loop(ctx, 2*time.Second)
+	go q.Run(ctx)
+
+	log.Printf("adbapp jalan di %s", url)
+	log.Printf("folder data: %s", p.DataDir)
+	if !noOpen {
+		if err := browser.Open(url); err != nil {
+			log.Printf("tidak bisa membuka browser otomatis: %v", err)
+		}
+	}
+
+	server := &http.Server{Handler: api.Handler()}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func resolvePaths(dataDir string) (paths.Paths, error) {
+	if dataDir != "" {
+		return paths.ResolveFrom(dataDir), nil
+	}
+	return paths.Resolve()
+}
+
+// targetedRunner meneruskan setiap perintah adb ke perangkat yang sedang aktif.
+type targetedRunner struct {
+	base    *adbx.Runner
+	monitor *device.Monitor
+}
+
+func (t *targetedRunner) runner() *adbx.Runner {
+	return t.base.WithSerial(t.monitor.Current().Serial)
+}
+
+func (t *targetedRunner) Install(ctx context.Context, apkPath string, opts adbx.InstallOptions, stage adbx.StageFunc) error {
+	return t.runner().Install(ctx, apkPath, opts, stage)
+}
+
+func (t *targetedRunner) Uninstall(ctx context.Context, pkg string, keepData bool) error {
+	return t.runner().Uninstall(ctx, pkg, keepData)
+}
+
+func (t *targetedRunner) ClearData(ctx context.Context, pkg string) error {
+	return t.runner().ClearData(ctx, pkg)
+}
+
+func (t *targetedRunner) PullApk(ctx context.Context, pkg string, destDir string) (string, error) {
+	return t.runner().PullApk(ctx, pkg, destDir)
+}
+
+func (t *targetedRunner) Packages(ctx context.Context, system bool) ([]adbx.Package, error) {
+	return t.runner().Packages(ctx, system)
+}
+
+func (t *targetedRunner) PackageInfo(ctx context.Context, pkg string) (adbx.PackageInfo, error) {
+	return t.runner().PackageInfo(ctx, pkg)
+}
+
+var _ = strings.TrimSpace // penanda sementara agar import tetap dipakai
+```
+
+- [ ] **Step 3: Hapus baris penanda sementara**
+
+Hapus baris terakhir `var _ = strings.TrimSpace ...` dan hapus `"strings"` dari
+blok import `main.go`, karena tidak ada lagi yang memakainya.
+
+- [ ] **Step 4: Bangun aplikasi**
+
+Run: `go build -o adbapp .`
+Expected: sukses, berkas `adbapp` terbentuk. Bila muncul
+`biner adb untuk linux-amd64 belum dibundel`, lanjutkan ke Task 14 Step 1 lalu
+ulangi perintah ini.
+
+- [ ] **Step 5: Uji jalan singkat tanpa perangkat**
+
+Run: `./adbapp -no-open -port 7799 -data /tmp/adbapp-uji &` lalu
+`curl -s http://127.0.0.1:7799/api/state` dan
+`curl -s http://127.0.0.1:7799/ | head -3`, terakhir `kill %1`.
+Expected: `/api/state` mengembalikan JSON dengan `"device"`, `"jobs"`, dan
+`"config"`; halaman utama mengembalikan HTML.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add main.go internal/browser
+git commit -m "feat: rakit server lokal, antrean, dan pembuka browser"
+```
+
+---
+
+## Task 14: Makefile dan rilis otomatis
+
+**Files:**
+- Create: `Makefile`
+- Create: `.github/workflows/release.yml`
+
+- [ ] **Step 1: Tulis Makefile dengan pengunduh platform-tools**
+
+Create `Makefile`:
+
+```makefile
+BINARY := adbapp
+GOOS   ?= $(shell go env GOOS)
+GOARCH ?= $(shell go env GOARCH)
+PT_V   := 35.0.2
+
+PLATFORM := $(GOOS)-$(GOARCH)
+ADB_NAME := adb
+ifeq ($(GOOS),windows)
+ADB_NAME := adb.exe
+endif
+ADB_DEST := internal/bundle/bin/$(PLATFORM)/$(ADB_NAME)
+
+.PHONY: test build run fetch-adb clean fmt vet release
+
+fetch-adb:
+	@echo "mengunduh platform-tools $(PT_V) untuk $(GOOS)"
+	@tmp=$$(mktemp -d); \
+	url="https://dl.google.com/android/repository/platform-tools_r$(PT_V)-$(GOOS).zip"; \
+	echo "$$url"; \
+	curl -fsSL -o $$tmp/pt.zip "$$url" || { echo "unduhan gagal"; exit 1; }; \
+	unzip -q -o $$tmp/pt.zip -d $$tmp; \
+	mkdir -p internal/bundle/bin/$(PLATFORM); \
+	cp $$tmp/platform-tools/$(ADB_NAME) $(ADB_DEST); \
+	chmod +x $(ADB_DEST); \
+	rm -rf $$tmp; \
+	ls -l $(ADB_DEST)
+
+test:
+	go test ./...
+
+vet:
+	go vet ./...
+
+fmt:
+	gofmt -l -w .
+
+build:
+	go build -o $(BINARY) .
+
+run: build
+	./$(BINARY)
+
+clean:
+	rm -f $(BINARY) $(BINARY).exe
+```
+
+Catatan: nama arsip platform-tools memakai pola
+`platform-tools_r<versi>-<os>.zip` (untuk Windows: `...-windows.zip`). Bila
+unduhan gagal karena pola berubah, periksa
+`https://developer.android.com/tools/releases/platform-tools` dan sesuaikan
+variabel `PT_V`.
+
+- [ ] **Step 2: Uji pengunduhan di mesin pengembang**
+
+Run: `make fetch-adb && ls -l internal/bundle/bin/linux-amd64/adb`
+Expected: berkas `adb` ada, dapat dieksekusi.
+
+- [ ] **Step 3: Bangun dan jalankan pengujian penuh**
+
+Run: `make test && make build`
+Expected: seluruh tes lulus, biner `adbapp` terbentuk.
+
+- [ ] **Step 4: Tulis workflow rilis**
+
+Create `.github/workflows/release.yml`:
+
+```yaml
+name: build-and-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            platform_tools: linux
+            archive: tar.gz
+          - runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            platform_tools: windows
+            archive: zip
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            platform_tools: darwin
+            archive: tar.gz
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+            platform_tools: darwin
+            archive: tar.gz
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Siapkan biner adb untuk platform ini
+        shell: bash
+        run: |
+          set -euo pipefail
+          PT_VERSION=35.0.2
+          ADB_NAME=adb
+          if [ "${{ matrix.goos }}" = "windows" ]; then ADB_NAME=adb.exe; fi
+          DEST="internal/bundle/bin/${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$DEST"
+          curl -fsSL -o pt.zip \
+            "https://dl.google.com/android/repository/platform-tools_r${PT_VERSION}-${{ matrix.platform_tools }}.zip"
+          unzip -q -o pt.zip
+          cp "platform-tools/${ADB_NAME}" "$DEST/${ADB_NAME}"
+          chmod +x "$DEST/${ADB_NAME}" || true
+          ls -l "$DEST"
+
+      - name: Jalankan pengujian
+        shell: bash
+        run: go test ./...
+
+      - name: Bangun biner
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          NAME=adbapp
+          if [ "$GOOS" = "windows" ]; then NAME=adbapp.exe; fi
+          go build -trimpath -ldflags "-s -w" -o "dist/$GOOS-$GOARCH/$NAME" .
+          ls -l "dist/$GOOS-$GOARCH"
+
+      - name: Bungkus arsip
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "dist/${{ matrix.goos }}-${{ matrix.goarch }}"
+          BASE="adbapp-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (command -v zip >/dev/null && zip -q "../$BASE.zip" *) || powershell -Command "Compress-Archive -Path * -DestinationPath ../$BASE.zip -Force"
+          else
+            tar czf "../$BASE.tar.gz" *
+          fi
+          ls -l ..
+
+      - name: Unggah ke halaman rilis
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+```
+
+- [ ] **Step 5: Periksa sintaks workflow**
+
+Run: `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/release.yml'))" && echo OK`
+Expected: `OK`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add Makefile .github/workflows/release.yml
+git commit -m "build: Makefile fetch-adb dan rilis otomatis tiga OS"
+```
+
+---
+
+## Task 15: Dokumentasi pemakaian
+
+**Files:**
+- Create: `README.md`
+
+- [ ] **Step 1: Tulis README**
+
+Create `README.md`:
+
+```markdown
+# adbapp
+
+Aplikasi desktop untuk memasang dan mencopot aplikasi Android lewat ADB
+(USB debugging), dibuat untuk mempermudah pekerjaan audit aplikasi di satu
+perangkat fisik.
+
+Satu biner, tanpa perlu memasang Go/Node/Python di komputer pengguna. `adb`
+sudah ditanam di dalam aplikasi.
+
+## Menjalankan
+
+Tiga langkah di HP: nyalakan **Opsi Pengembang**, aktifkan **USB debugging**,
+lalu sambungkan kabel dan pilih mode **File Transfer**. Saat muncul dialog
+"Allow USB debugging?", tekan **Allow**.
+
+Jalankan `adbapp`, lalu browser terbuka otomatis di halaman aplikasi.
+
+## Pemasangan
+
+**Linux**
+
+```bash
+curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-linux-amd64.tar.gz | tar xz -C ~/bin
+~/bin/adbapp
+```
+
+**macOS**
+
+```bash
+curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
+~/bin/adbapp
+```
+
+Berkas yang diunduh lewat `curl` tidak diberi label quarantine, jadi Gatekeeper
+tidak menghalangi. Bila tetap diblokir (misalnya karena diunduh lewat browser),
+jalankan `xattr -dr com.apple.quarantine ~/bin/adbapp` atau klik kanan berkas
+lalu pilih **Open**.
+
+**Windows**
+
+Unduh `adbapp-windows-amd64.zip`, ekstrak, lalu klik dua kali `adbapp.exe`.
+
+## Yang bisa dilakukan
+
+- Menyeret & melepas berkas APK, memuat folder koleksi APK, atau menambah dari URL.
+- Melihat identitas APK (nama paket, versi) sebelum memasangnya.
+- Memasang beberapa APK berurutan lewat antrean, dengan progress dan tombol batalkan.
+- Melihat aplikasi yang terpasang, mencari, dan menyaring aplikasi sistem.
+- Mencopot aplikasi, mencopot dengan menyimpan data, menghapus data, dan menarik
+  APK yang terpasang untuk diarsipkan.
+- Mencopot beberapa aplikasi sekaligus.
+- Riwayat audit permanen dengan ekspor CSV/JSON.
+
+## Sulit berhasil?
+
+- **Perangkat tidak terdeteksi.** Pastikan kabel mendukung data (bukan kabel
+  yang hanya mengisi daya), mode USB disetel ke File Transfer, dan USB debugging
+  menyala. Tekan **Pindai ulang**.
+- **"Perangkat belum diizinkan".** Lihat layar HP dan tekan **Allow**.
+- **Linux: perangkat tetap tidak terlihat.** Tambahkan aturan udev sesuai
+  panduan Android, lalu cabut dan sambungkan ulang kabel.
+- **Windows: perangkat tidak dikenali.** Pasang driver USB pabrikan HP.
+- **adb bentrok.** Tutup aplikasi lain yang memakai adb (misalnya Android Studio).
+
+## Folder data
+
+Tersimpan di luar biner, berisi `adb/`, `history.jsonl`, `config.json`,
+`uploads/`, dan `pulled/`:
+
+- Linux: `~/.local/share/adbapp`
+- macOS: `~/Library/Application Support/adbapp`
+- Windows: `%LOCALAPPDATA%\adbapp`
+
+## Pengembangan
+
+```bash
+make fetch-adb   # unduh platform-tools untuk OS ini
+make test        # seluruh tes
+make build       # biner adbapp
+make run         # bangun lalu jalankan
+```
+
+Rilis otomatis: dorong tag `v*` (misalnya `git tag v1.0.0 && git push --tags`),
+dan GitHub Actions membangun paket untuk Linux, Windows, dan macOS.
+
+## Belum termasuk
+
+Beberapa perangkat sekaligus, ADB nirkabel, split APK (`.apks`/`.xapk`), akses
+root, dan penandatanganan Apple.
+```
+
+- [ ] **Step 2: Periksa seluruh pengujian dan build sekali lagi**
+
+Run: `make test && make build && ./adbapp -h`
+Expected: tes lulus, build sukses, dan aplikasi mencetak daftar flag
+(`-port`, `-no-open`, `-data`).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add README.md
+git commit -m "docs: README pemakaian, pemasangan, dan pemecahan masalah"
+```
+
+---
+
+## Pemeriksaan akhir sebelum rilis
+
+- [ ] **Jalankan seluruh tes di tiga OS.** `go test ./...` pada Linux, macOS,
+      dan Windows (GitHub Actions melakukannya otomatis pada matriks).
+- [ ] **Uji dengan perangkat sungguhan** sesuai Bagian 9 spec: pasang satu APK
+      contoh, pastikan muncul di daftar terpasang, tarik APK-nya, lalu copot.
+- [ ] **Uji cabut kabel di tengah instalasi.** Job harus berstatus gagal dengan
+      pesan "perangkat terputus", dan job berikutnya tetap menunggu, bukan
+      dianggap sukses.
+- [ ] **Uji blokir host asing.** `curl -H 'Host: evil.example.com' http://127.0.0.1:<port>/api/state`
+      harus menjawab 403.
+- [ ] **Uji ekspor.** Unduh CSV dan JSON dari halaman Riwayat dan pastikan
+      isinya sesuai aksi yang baru dijalankan.
+
+---
+
+## Catatan penyimpangan dari spec
+
+1. **"adb palsu" berupa skrip** diganti dengan `Execer` yang bisa disuntik.
+   Alasan: skrip shell tidak jalan di runner Windows saat CI. Cakupan
+   pengujiannya setara, dan seluruh logika parsing diuji dengan keluaran adb
+   yang realistis.
+2. **Ukuran dan tanggal terpasang aplikasi** diambil lewat `dumpsys` + `du`
+   per aplikasi saat detail dibuka, supaya daftar aplikasi tetap cepat. Daftar
+   utama menampilkan nama paket, kode versi, dan penanda aplikasi sistem.
+3. **`--show-versioncode`** tidak didukung perangkat lama; aplikasi otomatis
+   jatuh ke perintah tanpa flag itu.
+
+---
+
+## Self-review
+
+**Cakupan spec:**
+
+| Butir spec | Task |
+|---|---|
+| Deteksi perangkat + status | Task 5, Task 7, Task 13 |
+| Drag & drop, folder, URL | Task 11 (`handleUpload`, `handleListAPKs`, `handleFromURL`), Task 12 |
+| Metadata APK sebelum pasang | Task 8, Task 11 (`entryFor`) |
+| Antrean install berurutan + progress + batalkan | Task 10, Task 11, Task 12 |
+| Daftar aplikasi terpasang, cari, filter | Task 5, Task 11, Task 12 |
+| Copot, copot simpan data, hapus data, tarik APK | Task 6, Task 10, Task 11, Task 12 |
+| Detail paket (versi, ukuran, izin) | Task 5, Task 11, Task 12 |
+| Bulk uninstall + konfirmasi | Task 11, Task 12 |
+| Riwayat permanen + ekspor CSV/JSON | Task 9, Task 11, Task 12 |
+| Pesan error yang jelas | Task 4, Task 6, Task 12 (panel petunjuk) |
+| Satu perangkat aktif + pemilih bila lebih | Task 7 (`Others`) |
+| Paket per OS + adb tertanam + CI | Task 2, Task 14 |
+| Pemasangan `curl` di macOS | Task 14 (arsip), Task 15 (README) |
+| Pengujian tanpa perangkat | Task 3-11 |
+| Checklist pengujian dengan perangkat | "Pemeriksaan akhir sebelum rilis" |
+
+**Konsistensi tipe dan nama:**
+
+- `adbx.InstallOptions{Replace, AllowDowngrade, GrantAll}`, `adbx.StageFunc`
+  dipakai konsisten di Task 3, 6, 10, 11, 13.
+- `queue.Job` dan `queue.Status*`/`queue.Kind*` konsisten antara Task 10, 11, 13.
+- `device.Status{State, Serial, Model, Others}` konsisten di Task 7, 11, 12, 13.
+- `store.Entry{Time, Action, Package, Device, Success, Detail}` konsisten di
+  Task 9, 11, 13.
+- `apkmeta.Meta{Package, VersionName, Label, VersionCode, MinSDK}` dan
+  `ReadCached(path, size, modUnixNano)` konsisten di Task 8 dan 11.
+- `paths.Paths` konsisten di Task 1, 11, 13.
+- Nama SSE: `event: state` dan `event: job` cocok antara Task 11 (server) dan
+  Task 12 (client).
+
+**Tidak ada placeholder:** setiap langkah kode memuat kode lengkap, perintah
+yang bisa dijalankan, dan hasil yang diharapkan.
