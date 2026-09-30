@@ -868,7 +868,16 @@ git commit -m "feat(bundle): ekstrak biner adb tertanam ke folder data"
 
 **Files:**
 - Create: `internal/adbx/adbx.go`
+- Create: `internal/adbx/errors.go` (sementara, isi lengkap di Task 4)
 - Test: `internal/adbx/adbx_test.go`
+
+Catatan semantik penting: bila konteks dibatalkan, `osExec.Run` mengembalikan
+`ctx.Err()` (bukan `*exec.ExitError`) sehingga `errors.Is(err, context.Canceled)`
+dan `errors.Is(err, context.DeadlineExceeded)` bekerja; Task 10 bergantung pada ini
+untuk menandai job yang dibatalkan. `New` juga memasang batas waktu pengaman bawaan
+15 menit untuk setiap perintah agar adb yang menggantung tidak memblokir selamanya;
+batas itu bukan timeout UI, dan pembatalan eksplisit dari antrean tetap berlaku
+seketika.
 
 - [ ] **Step 1: Tulis tes yang gagal**
 
@@ -879,7 +888,13 @@ package adbx
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type fakeExec struct {
@@ -925,6 +940,155 @@ func TestRunWithoutSerialOmitsFlag(t *testing.T) {
 		t.Fatalf("flag -s seharusnya tidak ada: %v", fe.calls[0])
 	}
 }
+
+// blockingExec menunggu konteks selesai lalu mengembalikan ctx.Err(), meniru
+// proses yang dibunuh saat konteks dibatalkan.
+type blockingExec struct{}
+
+func (blockingExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	<-ctx.Done()
+	return Result{}, ctx.Err()
+}
+
+func TestRunPropagatesContextCancellation(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(blockingExec{}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := r.Run(ctx, "shell", "id")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+type deadlineExec struct{}
+
+func (deadlineExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	return Result{}, context.DeadlineExceeded
+}
+
+func TestRunPropagatesDeadlineExceeded(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(deadlineExec{}))
+	_, err := r.Run(context.Background(), "shell", "id")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestRunClassifiesNonZeroExit(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stderr: "error: device offline", ExitCode: 1}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	_, err := r.Run(context.Background(), "shell", "id")
+	if !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("got %v, want ErrDeviceNotFound", err)
+	}
+}
+
+type errorExec struct{ err error }
+
+func (e *errorExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	return Result{}, e.err
+}
+
+func TestRunWrapsNonExitError(t *testing.T) {
+	perr := &fs.PathError{Op: "fork/exec", Path: "/usr/bin/adb", Err: errors.New("no such file")}
+	r := New("/usr/bin/adb", WithExecer(&errorExec{err: perr}))
+	_, err := r.Run(context.Background(), "devices")
+	if err == nil {
+		t.Fatal("ingin error, dapat nil")
+	}
+	if !strings.Contains(err.Error(), "/usr/bin/adb") {
+		t.Fatalf("error harus menyebut path adb: %v", err)
+	}
+	var got *fs.PathError
+	if !errors.As(err, &got) {
+		t.Fatalf("error harus membungkus PathError: %v", err)
+	}
+}
+
+func TestOutputTrimsWhitespace(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: " hello\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.Output(context.Background(), "shell", "echo", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q want %q", got, "hello")
+	}
+}
+
+func TestWithTimeoutZeroOrNegativeMeansNoTimeout(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "ok"}, {Stdout: "ok"}}}
+	for _, d := range []time.Duration{0, -time.Second} {
+		r := New("/usr/bin/adb", WithExecer(fe), WithTimeout(d))
+		if _, err := r.Run(context.Background(), "devices"); err != nil {
+			t.Fatalf("timeout %v: %v", d, err)
+		}
+	}
+}
+
+func TestWithExecerNilKeepsDefault(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(nil))
+	if r.exec == nil {
+		t.Fatal("exec tidak boleh nil")
+	}
+}
+
+// safeExec aman dipakai bersamaan dan merekam seluruh panggilan.
+type safeExec struct {
+	mu    sync.Mutex
+	calls [][]string
+}
+
+func (s *safeExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	s.mu.Lock()
+	s.calls = append(s.calls, append([]string{name}, args...))
+	s.mu.Unlock()
+	return Result{Stdout: "ok"}, nil
+}
+
+func TestRunConcurrentSameRunner(t *testing.T) {
+	const n = 8
+	se := &safeExec{}
+	r := New("/usr/bin/adb", WithExecer(se), WithSerial("SER"))
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			arg := fmt.Sprintf("arg-%d", i)
+			if _, err := r.Run(context.Background(), "shell", arg); err != nil {
+				t.Errorf("goroutine %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if len(se.calls) != n {
+		t.Fatalf("harus %d panggilan, dapat %d", n, len(se.calls))
+	}
+	wantPrefix := []string{"/usr/bin/adb", "-s", "SER", "shell"}
+	seen := make(map[string]bool, n)
+	for _, c := range se.calls {
+		if len(c) != 5 {
+			t.Fatalf("jumlah args tak terduga: %v", c)
+		}
+		for i := range wantPrefix {
+			if c[i] != wantPrefix[i] {
+				t.Fatalf("prefix args salah: %v", c)
+			}
+		}
+		seen[c[4]] = true
+	}
+	for i := 0; i < n; i++ {
+		if !seen[fmt.Sprintf("arg-%d", i)] {
+			t.Fatalf("arg-%d hilang (cross-talk): %v", i, se.calls)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
@@ -943,9 +1107,11 @@ package adbx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Result adalah keluaran satu perintah adb.
@@ -956,7 +1122,8 @@ type Result struct {
 }
 
 // Execer menjalankan sebuah program. Implementasi asli memakai os/exec;
-// pengujian menyuntikkan versi tiruan.
+// pengujian menyuntikkan versi tiruan. Implementasi harus aman dipakai
+// bersamaan (concurrent-safe) karena satu Runner dapat dipakai banyak goroutine.
 type Execer interface {
 	Run(ctx context.Context, name string, args ...string) (Result, error)
 }
@@ -971,8 +1138,14 @@ func (osExec) Run(ctx context.Context, name string, args ...string) (Result, err
 	err := cmd.Run()
 	res := Result{Stdout: out.String(), Stderr: errBuf.String()}
 	if err != nil {
+		// Bila konteks dibatalkan, exec.CommandContext membunuh proses dan
+		// mengembalikan *exec.ExitError. Kembalikan ctx.Err() agar pemanggil
+		// dapat mengenali context.Canceled / context.DeadlineExceeded.
+		if cerr := ctx.Err(); cerr != nil {
+			return res, cerr
+		}
 		var ee *exec.ExitError
-		if ok := asExitError(err, &ee); ok {
+		if errors.As(err, &ee) {
 			res.ExitCode = ee.ExitCode()
 			return res, nil
 		}
@@ -986,20 +1159,35 @@ type Runner struct {
 	adbPath string
 	exec    Execer
 	serial  string
+	timeout time.Duration
 }
 
 type Option func(*Runner)
 
+// WithExecer mengganti pelaksana perintah. Nilai nil diabaikan sehingga
+// Runner tetap memakai pelaksana bawaan dan tidak panik saat dipanggil.
 func WithExecer(e Execer) Option {
-	return func(r *Runner) { r.exec = e }
+	return func(r *Runner) {
+		if e != nil {
+			r.exec = e
+		}
+	}
 }
 
 func WithSerial(serial string) Option {
 	return func(r *Runner) { r.serial = serial }
 }
 
+// WithTimeout memberi batas waktu pengaman untuk setiap perintah adb. Nilai
+// nol atau negatif berarti tanpa batas waktu.
+func WithTimeout(d time.Duration) Option {
+	return func(r *Runner) { r.timeout = d }
+}
+
+// New membuat Runner. Batas waktu bawaan 15 menit dipasang sebagai jaring
+// pengaman agar adb yang menggantung tidak memblokir selamanya.
 func New(adbPath string, opts ...Option) *Runner {
-	r := &Runner{adbPath: adbPath, exec: osExec{}}
+	r := &Runner{adbPath: adbPath, exec: osExec{}, timeout: 15 * time.Minute}
 	for _, o := range opts {
 		o(r)
 	}
@@ -1007,13 +1195,13 @@ func New(adbPath string, opts ...Option) *Runner {
 }
 
 // WithSerial mengembalikan salinan Runner yang menargetkan serial tertentu.
+// Ini salinan dangkal (shallow): aman hanya selama Runner memegang field
+// skalar/interface saja.
 func (r *Runner) WithSerial(serial string) *Runner {
 	clone := *r
 	clone.serial = serial
 	return &clone
 }
-
-func (r *Runner) Serial() string { return r.serial }
 
 func (r *Runner) args(rest ...string) []string {
 	args := make([]string, 0, len(rest)+2)
@@ -1026,9 +1214,14 @@ func (r *Runner) args(rest ...string) []string {
 // Run menjalankan perintah adb. Error yang dikembalikan sudah diterjemahkan
 // bila keluarannya cocok dengan pola kegagalan yang dikenal.
 func (r *Runner) Run(ctx context.Context, rest ...string) (Result, error) {
+	if r.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.timeout)
+		defer cancel()
+	}
 	res, err := r.exec.Run(ctx, r.adbPath, r.args(rest...)...)
 	if err != nil {
-		return res, fmt.Errorf("gagal menjalankan adb: %w", err)
+		return res, fmt.Errorf("menjalankan %s %s: %w", r.adbPath, strings.Join(rest, " "), err)
 	}
 	if res.ExitCode != 0 {
 		return res, Classify(res)
@@ -1046,20 +1239,6 @@ func (r *Runner) Output(ctx context.Context, rest ...string) (string, error) {
 }
 ```
 
-Create `internal/adbx/exec_error.go`:
-
-```go
-package adbx
-
-import "errors"
-import "os/exec"
-
-// asExitError memisahkan pengecekan tipe ini agar mudah dibaca di adbx.go.
-func asExitError(err error, target **exec.ExitError) bool {
-	return errors.As(err, target)
-}
-```
-
 - [ ] **Step 4: Tambahkan `Classify` agar tes bisa dikompilasi**
 
 Create `internal/adbx/errors.go` (sementara, isi lengkap di Task 4):
@@ -1067,10 +1246,27 @@ Create `internal/adbx/errors.go` (sementara, isi lengkap di Task 4):
 ```go
 package adbx
 
+import (
+	"errors"
+	"strings"
+)
+
+// ErrDeviceNotFound dikembalikan bila adb melaporkan perangkat tidak ada atau
+// sedang offline. Sentinel lain serta daftar pola lengkap ditambahkan pada Task 4.
+var ErrDeviceNotFound = errors.New("perangkat tidak ditemukan")
+
 // Classify menerjemahkan keluaran adb yang gagal menjadi error yang jelas.
 // Daftar lengkap pola ditambahkan pada Task 4.
 func Classify(res Result) error {
-	return &CommandError{Result: res}
+	lower := strings.ToLower(res.Stderr + "\n" + res.Stdout)
+	switch {
+	case strings.Contains(lower, "device not found"),
+		strings.Contains(lower, "device offline"),
+		strings.Contains(lower, "no devices/emulators found"):
+		return ErrDeviceNotFound
+	default:
+		return &CommandError{Result: res}
+	}
 }
 
 // CommandError adalah kegagalan adb yang belum dikenali polanya.
@@ -1099,10 +1295,14 @@ func firstLine(s string) string {
 }
 ```
 
+Catatan: tes `TestRunClassifiesNonZeroExit` memakai `ErrDeviceNotFound` supaya
+jalur "exit code != 0 diproses `Classify`" bisa diverifikasi sejak Task 3; Task 4
+mengganti seluruh isi `errors.go` dengan daftar sentinel dan pola yang lengkap.
+
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/adbx/ -v`
-Expected: PASS untuk kedua tes.
+Expected: PASS untuk seluruh tes.
 
 - [ ] **Step 6: Commit**
 
