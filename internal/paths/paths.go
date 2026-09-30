@@ -8,6 +8,7 @@ import (
 	"runtime"
 )
 
+// Paths adalah lokasi folder data aplikasi dan berkas-berkas yang dikelolanya.
 type Paths struct {
 	DataDir     string
 	AdbDir      string
@@ -46,7 +47,14 @@ func baseDir() (string, error) {
 		if v := os.Getenv("LOCALAPPDATA"); v != "" {
 			return v, nil
 		}
-		return "", fmt.Errorf("variabel LOCALAPPDATA kosong")
+		if v, err := os.UserConfigDir(); err == nil && v != "" {
+			return v, nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, "AppData", "Local"), nil
 	case "darwin":
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -54,7 +62,7 @@ func baseDir() (string, error) {
 		}
 		return filepath.Join(home, "Library", "Application Support"), nil
 	default:
-		if v := os.Getenv("XDG_DATA_HOME"); v != "" {
+		if v := os.Getenv("XDG_DATA_HOME"); v != "" && filepath.IsAbs(v) {
 			return v, nil
 		}
 		home, err := os.UserHomeDir()
@@ -69,13 +77,8 @@ func baseDir() (string, error) {
 func (p Paths) Ensure() error {
 	for _, dir := range []string{p.DataDir, p.AdbDir, p.UploadsDir, p.PulledDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
+			return fmt.Errorf("gagal membuat folder %s: %w", dir, err)
 		}
 	}
 	return nil
-}
-
-func isDir(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && st.IsDir()
 }

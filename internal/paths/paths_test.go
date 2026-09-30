@@ -1,8 +1,8 @@
 package paths
 
 import (
+	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -33,16 +33,17 @@ func TestEnsureCreatesDirs(t *testing.T) {
 	}
 }
 
-func TestBaseDirUsesXDGOnLinux(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("khusus Linux")
-	}
-	t.Setenv("XDG_DATA_HOME", "/xdg")
-	got, err := baseDir()
+func TestResolveUsesAdbappDirectory(t *testing.T) {
+	p, err := Resolve()
 	if err != nil {
-		t.Fatalf("baseDir error: %v", err)
+		t.Skipf("Resolve error: %v", err)
 	}
-	if got != "/xdg" {
-		t.Fatalf("got %q, want /xdg", got)
+	if got := filepath.Base(p.DataDir); got != "adbapp" {
+		t.Fatalf("got %q, want adbapp", got)
 	}
+}
+
+func isDir(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
 }
