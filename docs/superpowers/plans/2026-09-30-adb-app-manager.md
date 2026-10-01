@@ -7667,6 +7667,14 @@ jobs:
             dist/*.tar.gz
 ```
 
+Catatan penting (ditemukan saat validasi): berkas tes ber-tag `//go:build windows`
+(hanya `internal/paths/base_windows_test.go`) TIDAK ikut dikompilasi bila
+`GOOS` bukan windows, padahal paket rilis Windows dibangun di `ubuntu-latest`.
+Tanpa tambahan, jalur data `%LOCALAPPDATA%` tidak pernah diuji di CI. Karena itu
+workflow memuat job terpisah `test-windows` yang berjalan di `windows-latest` dan
+menjalankan `go test ./... -count=1` secara native. Job `build` tetap di
+ubuntu/macos karena langkah pengemasan butuh `unzip`/`zip` yang andal.
+
 - [ ] **Step 5: Periksa sintaks workflow**
 
 Run: `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/release.yml'))" && echo OK`

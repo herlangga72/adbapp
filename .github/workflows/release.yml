@@ -9,6 +9,24 @@ permissions:
   contents: write
 
 jobs:
+  # Berkas tes ber-tag `//go:build windows` (jalur data %LOCALAPPDATA% dan
+  # pengekstrakan adb.exe + DLL) hanya ikut dikompilasi bila GOOS=windows.
+  # Karena paket rilis Windows dibangun di ubuntu-latest, tes itu tidak pernah
+  # dieksekusi di sana. Job ini menjalankannya sungguhan di Windows.
+  test-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Jalankan pengujian di Windows
+        shell: bash
+        run: go test ./... -count=1
+
   build:
     strategy:
       fail-fast: false
