@@ -156,6 +156,11 @@ func (q *Queue) Cancel(id string) error {
 		snap := *job
 		q.mu.Unlock()
 		q.broadcast(snap)
+		// Setiap aksi harus tercatat di riwayat, termasuk pembatalan saat masih
+		// menunggu. Bentuk argumen disamakan dengan jalur job berjalan.
+		if q.onDone != nil {
+			q.onDone(snap, context.Canceled)
+		}
 		return nil
 	case StatusRunning:
 		cancel := q.cancels[id]
@@ -271,6 +276,12 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 	case err != nil && errors.Is(err, context.Canceled):
 		job.Status = StatusCancelled
 		job.Message = "dibatalkan"
+	case err != nil && errors.Is(err, adbx.ErrDeviceNotFound):
+		// Perangkat dicabut di tengah proses: beri pesan yang lebih jelas, tetapi
+		// error asli tetap disimpan agar bisa ditelusuri.
+		job.Status = StatusFailed
+		job.Message = "perangkat terputus"
+		job.Error = err.Error()
 	case err != nil:
 		job.Status = StatusFailed
 		job.Error = err.Error()

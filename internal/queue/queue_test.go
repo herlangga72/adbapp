@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -167,6 +168,60 @@ func TestFailingJobDoesNotStopQueue(t *testing.T) {
 	}
 	if got := statusOf(t, q, a.ID).Error; got == "" {
 		t.Fatal("pesan error job pertama kosong")
+	}
+}
+
+func TestCancelQueuedJobNotifiesOnDone(t *testing.T) {
+	fr := newFakeRunner()
+	fr.block = make(chan struct{})
+	defer close(fr.block)
+	var mu sync.Mutex
+	var done []Job
+	q := New(fr, WithOnDone(func(j Job, err error) {
+		mu.Lock()
+		done = append(done, j)
+		mu.Unlock()
+	}))
+	runQueue(t, q)
+
+	first := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/first.apk"})
+	second := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/second.apk"})
+
+	waitFor(t, "job pertama berjalan", func() bool {
+		return statusOf(t, q, first.ID).Status == StatusRunning
+	})
+	if err := q.Cancel(second.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+
+	waitFor(t, "callback menerima job yang dibatalkan", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, j := range done {
+			if j.ID == second.ID && j.Status == StatusCancelled {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestDeviceDisconnectedShowsClearMessage(t *testing.T) {
+	fr := newFakeRunner()
+	fr.fail["install:/tmp/a.apk"] = adbx.ErrDeviceNotFound
+	q := New(fr)
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	waitFor(t, "job gagal", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusFailed
+	})
+	got := statusOf(t, q, a.ID)
+	if got.Message != "perangkat terputus" {
+		t.Fatalf("pesan = %q, mau 'perangkat terputus'", got.Message)
+	}
+	if !strings.Contains(got.Error, adbx.ErrDeviceNotFound.Error()) {
+		t.Fatalf("error asli tidak tersimpan: %q", got.Error)
 	}
 }
 
