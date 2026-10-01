@@ -257,3 +257,80 @@ func TestUnknownKindFails(t *testing.T) {
 		t.Fatal("job dengan jenis tak dikenal harus punya pesan error")
 	}
 }
+
+func TestRunReturnsOnContextCancel(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		q.Run(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run tidak kembali setelah konteks dibatalkan")
+	}
+}
+
+func TestSubscribeDeliversAndUnsubscribeIsIdempotent(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+
+	ch, unsubscribe := q.Subscribe()
+	q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/sub.apk"})
+
+	select {
+	case _, ok := <-ch:
+		if !ok {
+			t.Fatal("saluran langganan ditutup sebelum mengirim pembaruan")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("tidak menerima pembaruan langganan")
+	}
+
+	// Panggilan kedua harus idempoten dan tidak boleh panik.
+	unsubscribe()
+	unsubscribe()
+
+	// Setelah unsubscribe, saluran ditutup sehingga tidak ada pengiriman baru.
+	closed := false
+	for !closed {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				closed = true
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("saluran langganan tidak ditutup setelah unsubscribe")
+		}
+	}
+
+	// Pelanggan lambat: saluran penuh tidak boleh menghambat Enqueue.
+	slow := New(newFakeRunner())
+	slowCh, slowUnsub := slow.Subscribe()
+	defer slowUnsub()
+
+	doneEnqueue := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			slow.Enqueue(Job{Kind: KindInstall, Target: "/tmp/slow.apk"})
+		}
+		close(doneEnqueue)
+	}()
+
+	select {
+	case <-doneEnqueue:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Enqueue terhambat oleh pelanggan dengan saluran penuh")
+	}
+	if len(slowCh) != cap(slowCh) {
+		t.Fatalf("saluran pelanggan lambat seharusnya penuh: len=%d cap=%d", len(slowCh), cap(slowCh))
+	}
+}
