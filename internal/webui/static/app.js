@@ -1,7 +1,17 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const state = { apks: [], packages: [], selectedApks: new Set(), selectedPkgs: new Set(), jobs: new Map() };
+const state = {
+  apks: [],
+  packages: [],
+  pkgDetail: {},
+  pkgFilter: 'all',
+  history: [],
+  selectedApks: new Set(),
+  selectedPkgs: new Set(),
+  jobs: new Map(),
+  deviceReady: false,
+};
 
 function toast(message, isError) {
   const el = $('toast');
@@ -45,13 +55,30 @@ function humanSize(bytes) {
   return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+function deviceReady() {
+  return state.deviceReady;
+}
+
+// updateActionButtons menonaktifkan aksi yang memerlukan perangkat siap
+// (spec §7) dan yang belum punya pilihan.
+function updateActionButtons() {
+  const ready = deviceReady();
+  $('load-folder').disabled = !ready;
+  $('install-selected').disabled = !ready || state.selectedApks.size === 0;
+  $('uninstall-selected').disabled = !ready || state.selectedPkgs.size === 0;
+  $('uninstall-keep-selected').disabled = !ready || state.selectedPkgs.size === 0;
+}
+
 function renderDevice(status) {
+  state.deviceReady = status.state === 'ready';
   const dot = $('dot');
   dot.className = 'dot ' + status.state;
   const label = $('device-label');
   const hint = $('hint');
   if (status.state === 'ready') {
-    label.textContent = `${status.model || status.serial} · siap`;
+    const name = status.model || status.serial || 'Perangkat';
+    const version = status.androidVersion ? ` · Android ${status.androidVersion}` : '';
+    label.textContent = `${name}${version} · siap`;
     hint.classList.add('hidden');
   } else if (status.state === 'unauthorized') {
     label.textContent = 'Perangkat belum diizinkan';
@@ -66,6 +93,9 @@ function renderDevice(status) {
     hint.textContent = 'Sambungkan HP dengan kabel USB dan pastikan USB debugging menyala.';
     hint.classList.remove('hidden');
   }
+  updateActionButtons();
+  renderApks();
+  renderPackages();
 }
 
 function renderApks() {
@@ -88,7 +118,7 @@ function renderApks() {
     tbody.appendChild(tr);
   });
   $('install-selected').textContent = `Pasang terpilih (${state.selectedApks.size})`;
-  $('install-selected').disabled = state.selectedApks.size === 0;
+  updateActionButtons();
 }
 
 function addApk(entry) {
@@ -97,25 +127,58 @@ function addApk(entry) {
   renderApks();
 }
 
-function renderPackages() {
+// filteredPackages mengembalikan daftar paket yang cocok dengan pencarian.
+function filteredPackages() {
   const term = $('search').value.toLowerCase();
+  return state.packages.filter((p) => p.name.toLowerCase().includes(term));
+}
+
+function detailFor(name) {
+  return state.pkgDetail[name] || null;
+}
+
+function updateSortOptions() {
+  const has = Object.keys(state.pkgDetail).length > 0;
+  $('sort').querySelectorAll('option[value="size"], option[value="date"]')
+    .forEach((o) => { o.disabled = !has; });
+  $('sort-hint').classList.toggle('hidden', has);
+}
+
+function renderPackages() {
   const sortMode = $('sort').value;
+  const hasDetail = Object.keys(state.pkgDetail).length > 0;
+  // Urut ukuran/tanggal butuh detail; sebelum itu jatuh kembali ke urut nama.
+  const mode = (sortMode === 'size' || sortMode === 'date') && !hasDetail ? 'name' : sortMode;
+
   const tbody = $('pkg-table').querySelector('tbody');
   tbody.innerHTML = '';
 
-  let rows = state.packages.filter((p) => p.name.toLowerCase().includes(term));
-  if (!sortMode.startsWith('system')) rows = rows.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const rows = filteredPackages();
+  if (mode === 'name') {
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (mode === 'size') {
+    rows.sort((a, b) => (detailFor(a.name)?.sizeBytes || 0) - (detailFor(b.name)?.sizeBytes || 0));
+  } else if (mode === 'date') {
+    rows.sort((a, b) => (detailFor(a.name)?.installTime || '').localeCompare(detailFor(b.name)?.installTime || ''));
+  }
 
   rows.forEach((pkg) => {
     const tr = document.createElement('tr');
     const locked = pkg.system;
+    const ready = deviceReady();
+    const detail = detailFor(pkg.name);
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedPkgs.has(pkg.name) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
       <td>${pkg.name} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
       <td>${pkg.versionCode || '-'}</td>
-      <td>
+      <td>${detail ? humanSize(detail.sizeBytes) : '-'}</td>
+      <td>${detail?.installTime || '-'}</td>
+      <td class="row-actions">
         <button class="secondary" data-act="detail">Detail</button>
-        <button class="danger" data-act="uninstall" ${locked ? 'disabled' : ''}>Copot</button>
+        <button class="danger" data-act="uninstall" ${locked || !ready ? 'disabled' : ''}>Copot</button>
+        <button class="secondary" data-act="uninstall_keep" ${locked || !ready ? 'disabled' : ''}>Copot (simpan data)</button>
+        <button class="secondary" data-act="clear_data" ${!ready ? 'disabled' : ''}>Hapus data</button>
+        <button class="secondary" data-act="pull" ${!ready ? 'disabled' : ''}>Tarik APK</button>
       </td>`;
     tr.querySelector('input').addEventListener('change', (e) => {
       if (e.target.checked) state.selectedPkgs.add(pkg.name); else state.selectedPkgs.delete(pkg.name);
@@ -123,13 +186,23 @@ function renderPackages() {
     });
     tr.querySelector('[data-act=detail]').addEventListener('click', () => showDetail(pkg.name));
     tr.querySelector('[data-act=uninstall]').addEventListener('click', () => {
-      if (confirm(`Copot ${pkg.name}?`)) createJobs('uninstall', [pkg.name]);
+      if (confirm(`Copot ${pkg.name}? Tindakan ini menghapus aplikasi dari HP.`)) createJobs('uninstall', [pkg.name]);
+    });
+    tr.querySelector('[data-act=uninstall_keep]').addEventListener('click', () => {
+      if (confirm(`Copot ${pkg.name} tapi simpan datanya?`)) createJobs('uninstall_keep', [pkg.name]);
+    });
+    tr.querySelector('[data-act=clear_data]').addEventListener('click', () => {
+      if (confirm(`Hapus data ${pkg.name}? Aplikasi tetap terpasang.`)) createJobs('clear_data', [pkg.name]);
+    });
+    tr.querySelector('[data-act=pull]').addEventListener('click', () => {
+      if (confirm(`Tarik APK ${pkg.name} ke folder hasil?`)) createJobs('pull', [pkg.name]);
     });
     tbody.appendChild(tr);
   });
 
   $('uninstall-selected').textContent = `Copot terpilih (${state.selectedPkgs.size})`;
   $('uninstall-keep-selected').textContent = `Copot (simpan data) (${state.selectedPkgs.size})`;
+  updateActionButtons();
 }
 
 async function showDetail(name) {
@@ -154,6 +227,42 @@ async function showDetail(name) {
   } catch (err) {
     el.textContent = 'Gagal memuat detail: ' + err.message;
   }
+}
+
+// loadDetails memperkaya baris yang terlihat dengan ukuran dan tanggal
+// terpasang, dengan concurrency terbatas (4 sekaligus).
+async function loadDetails() {
+  const targets = filteredPackages().map((p) => p.name).filter((n) => !state.pkgDetail[n]);
+  const btn = $('load-details');
+  if (!targets.length) {
+    toast('Detail sudah dimuat untuk baris yang terlihat');
+    updateSortOptions();
+    return;
+  }
+  btn.disabled = true;
+  const total = targets.length;
+  let done = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < targets.length) {
+      const name = targets[next++];
+      try {
+        state.pkgDetail[name] = await api('/api/packages/detail', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ package: name }),
+        });
+      } catch (e) { /* baris ini tetap tanpa detail */ }
+      done++;
+      btn.textContent = `Muat detail (${done}/${total})`;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, targets.length) }, worker));
+  btn.disabled = false;
+  btn.textContent = 'Muat detail';
+  updateSortOptions();
+  renderPackages();
+  toast(`Detail dimuat untuk ${done} aplikasi`);
 }
 
 function renderJobs() {
@@ -209,10 +318,22 @@ async function createJobs(kind, targets) {
 
 async function loadHistory() {
   try {
-    const entries = await api('/api/history?limit=200');
-    const tbody = $('history-table').querySelector('tbody');
-    tbody.innerHTML = '';
-    entries.forEach((e) => {
+    const raw = await api('/api/history?limit=200');
+    state.history = Array.isArray(raw) ? raw : [];
+    renderHistory();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function renderHistory() {
+  const term = ($('history-filter').value || '').toLowerCase();
+  const tbody = $('history-table').querySelector('tbody');
+  tbody.innerHTML = '';
+  state.history
+    .filter((e) => !term || [e.action, e.package, e.detail]
+      .some((f) => (f || '').toLowerCase().includes(term)))
+    .forEach((e) => {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>${new Date(e.time).toLocaleString('id-ID')}</td>
         <td>${e.action}</td><td>${e.package || '-'}</td>
@@ -220,15 +341,27 @@ async function loadHistory() {
         <td>${e.detail || ''}</td>`;
       tbody.appendChild(tr);
     });
-  } catch (err) {
-    toast(err.message, true);
-  }
 }
 
 async function loadPackages() {
   try {
-    const system = $('show-system').checked ? '1' : '0';
-    state.packages = await api(`/api/packages?system=${system}`);
+    if (state.pkgFilter === 'all') {
+      // "Semua" menggabungkan pihak ketiga dan sistem, dedup per nama.
+      const [third, system] = await Promise.all([
+        api('/api/packages?system=0'),
+        api('/api/packages?system=1'),
+      ]);
+      const byName = new Map();
+      (Array.isArray(third) ? third : []).forEach((p) => byName.set(p.name, p));
+      (Array.isArray(system) ? system : []).forEach((p) => byName.set(p.name, { ...p, system: true }));
+      state.packages = Array.from(byName.values());
+    } else {
+      const list = await api(`/api/packages?system=${state.pkgFilter === 'system' ? '1' : '0'}`);
+      state.packages = (Array.isArray(list) ? list : []).map((p) => ({
+        ...p,
+        system: state.pkgFilter === 'system',
+      }));
+    }
     renderPackages();
   } catch (err) {
     toast('Gagal memuat daftar aplikasi: ' + err.message, true);
@@ -281,6 +414,21 @@ async function uploadFile(file) {
   }
 }
 
+function setupBottomToggle() {
+  const section = document.querySelector('.bottom');
+  const toggle = $('bottom-toggle');
+  const collapsed = localStorage.getItem('adbapp.bottomCollapsed') === '1';
+  section.classList.toggle('collapsed', collapsed);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+
+  toggle.addEventListener('click', () => {
+    const next = !section.classList.contains('collapsed');
+    section.classList.toggle('collapsed', next);
+    toggle.setAttribute('aria-expanded', String(!next));
+    localStorage.setItem('adbapp.bottomCollapsed', next ? '1' : '0');
+  });
+}
+
 function bind() {
   $('refresh').addEventListener('click', () =>
     api('/api/device/refresh', { method: 'POST' }).catch((e) => toast(e.message, true)));
@@ -288,7 +436,8 @@ function bind() {
     const folder = $('folder').value.trim();
     if (!folder) { toast('Isi dulu folder koleksi', true); return; }
     try {
-      state.apks = await api(`/api/apks?folder=${encodeURIComponent(folder)}`);
+      const list = await api(`/api/apks?folder=${encodeURIComponent(folder)}`);
+      state.apks = Array.isArray(list) ? list : [];
       renderApks();
       await api('/api/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -322,9 +471,17 @@ function bind() {
     }
   });
   $('reload-packages').addEventListener('click', loadPackages);
-  $('show-system').addEventListener('change', loadPackages);
+  $('load-details').addEventListener('click', loadDetails);
+  document.querySelectorAll('.filter').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter').forEach((b) => b.classList.toggle('active', b === btn));
+      state.pkgFilter = btn.dataset.filter;
+      loadPackages();
+    });
+  });
   $('search').addEventListener('input', renderPackages);
   $('sort').addEventListener('change', renderPackages);
+  $('history-filter').addEventListener('input', renderHistory);
   $('export-csv').addEventListener('click', () => { window.location = '/api/history/export?format=csv'; });
   $('export-json').addEventListener('click', () => { window.location = '/api/history/export?format=json'; });
 }
@@ -332,7 +489,9 @@ function bind() {
 async function boot() {
   bind();
   setupDropZone();
+  setupBottomToggle();
   connectEvents();
+  updateSortOptions();
   try {
     const snapshot = await api('/api/state');
     renderDevice(snapshot.device);

@@ -58,16 +58,23 @@
   <section id="tab-installed" class="panel">
     <div class="toolbar">
       <input id="search" class="grow" placeholder="Cari aplikasi...">
+      <div class="filters" role="group" aria-label="Filter aplikasi">
+        <button class="chip filter active" data-filter="all">Semua</button>
+        <button class="chip filter" data-filter="third">Pihak ketiga</button>
+        <button class="chip filter" data-filter="system">Sistem</button>
+      </div>
       <select id="sort">
         <option value="name">Urut nama</option>
-        <option value="system">Aplikasi sistem dulu</option>
+        <option value="size" disabled>Urut ukuran</option>
+        <option value="date" disabled>Urut tanggal</option>
       </select>
-      <label><input type="checkbox" id="show-system"> Tampilkan sistem</label>
+      <button id="load-details" class="secondary">Muat detail</button>
       <button id="reload-packages" class="secondary">Muat ulang</button>
     </div>
+    <div id="sort-hint" class="muted small">Muat detail dulu untuk mengaktifkan urut ukuran/tanggal.</div>
     <table id="pkg-table">
       <thead>
-        <tr><th></th><th>Paket</th><th>Versi</th><th>Aksi</th></tr>
+        <tr><th></th><th>Paket</th><th>Versi</th><th>Ukuran</th><th>Tanggal</th><th>Aksi</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -80,22 +87,29 @@
 </main>
 
 <section class="bottom">
-  <div class="tabs small">
-    <button class="tab active" data-tab="queue">Antrean</button>
-    <button class="tab" data-tab="history">Riwayat</button>
-  </div>
-  <div id="tab-queue" class="panel active">
-    <ul id="queue-list" class="jobs"></ul>
-  </div>
-  <div id="tab-history" class="panel">
-    <div class="row">
-      <button id="export-csv" class="secondary">Ekspor CSV</button>
-      <button id="export-json" class="secondary">Ekspor JSON</button>
+  <button id="bottom-toggle" class="bottom-header" aria-expanded="true">
+    <span>Antrean &amp; Riwayat</span>
+    <span class="chevron" aria-hidden="true">▾</span>
+  </button>
+  <div class="bottom-body">
+    <div class="tabs small">
+      <button class="tab active" data-tab="queue">Antrean</button>
+      <button class="tab" data-tab="history">Riwayat</button>
     </div>
-    <table id="history-table">
-      <thead><tr><th>Waktu</th><th>Aksi</th><th>Paket</th><th>Hasil</th><th>Catatan</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div id="tab-queue" class="panel active">
+      <ul id="queue-list" class="jobs"></ul>
+    </div>
+    <div id="tab-history" class="panel">
+      <div class="row">
+        <input id="history-filter" class="grow" placeholder="Saring riwayat (aksi, paket, catatan)...">
+        <button id="export-csv" class="secondary">Ekspor CSV</button>
+        <button id="export-json" class="secondary">Ekspor JSON</button>
+      </div>
+      <table id="history-table">
+        <thead><tr><th>Waktu</th><th>Aksi</th><th>Paket</th><th>Hasil</th><th>Catatan</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
 </section>
 

@@ -88,3 +88,22 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: #111827; color: #fff; padding: 10px 14px; border-radius: 8px;
   box-shadow: 0 6px 20px rgba(0,0,0,.2); z-index: 20;
 }
+.small { font-size: 12px; }
+.filters { display: flex; gap: 4px; }
+.chip {
+  padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--muted); cursor: pointer;
+}
+.chip.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row-actions button { padding: 4px 8px; font-size: 12px; }
+.bottom-header {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px 8px 0 0;
+  background: var(--panel); cursor: pointer; font-weight: 600;
+}
+.bottom .tabs.small { padding: 8px 8px 0; }
+.bottom .panel { border-radius: 0 0 8px 8px; }
+.chevron { transition: transform .15s ease; }
+.bottom.collapsed .chevron { transform: rotate(-90deg); }
+.bottom.collapsed .bottom-body { display: none; }
