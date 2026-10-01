@@ -18,24 +18,24 @@ type Device struct {
 
 // Package adalah satu aplikasi yang terpasang di perangkat.
 type Package struct {
-	Name        string
-	ApkPath     string
-	VersionCode int64
-	System      bool
+	Name        string `json:"name"`
+	ApkPath     string `json:"apkPath,omitempty"`
+	VersionCode int64  `json:"versionCode,omitempty"`
+	System      bool   `json:"system,omitempty"`
 }
 
 // PackageInfo adalah detail satu aplikasi, untuk panel detail di UI.
 type PackageInfo struct {
-	Package     string
-	VersionName string
-	VersionCode int64
-	InstallTime string
-	UpdateTime  string
-	ApkPath     string
-	DataDir     string
-	SizeBytes   int64
-	Permissions []string
-	System      bool
+	Package     string   `json:"package"`
+	VersionName string   `json:"versionName,omitempty"`
+	VersionCode int64    `json:"versionCode,omitempty"`
+	InstallTime string   `json:"installTime,omitempty"`
+	UpdateTime  string   `json:"updateTime,omitempty"`
+	ApkPath     string   `json:"apkPath,omitempty"`
+	DataDir     string   `json:"dataDir,omitempty"`
+	SizeBytes   int64    `json:"sizeBytes,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+	System      bool     `json:"system,omitempty"`
 }
 
 func (r *Runner) Devices(ctx context.Context) ([]Device, error) {
