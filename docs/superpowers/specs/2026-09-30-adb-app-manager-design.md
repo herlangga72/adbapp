@@ -198,8 +198,7 @@ bukan perubahan pengalaman pengguna.
 
 **Windows** — unduh `.zip`, ekstrak, klik dua kali `adbapp.exe`.
 **Linux** — unduh `.tar.gz`, ekstrak, jalankan `./adbapp`.
-**macOS** — installer satu baris lewat Terminal (ganti `<user>` dengan pemilik
-repo rilis):
+**macOS** — installer satu baris lewat Terminal:
 
 ```
 curl -fsSL https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
