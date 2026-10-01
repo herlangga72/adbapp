@@ -117,7 +117,10 @@ dikirim balik ke browser lewat SSE tanpa perlu refresh.
    terputus"; sisa antrean berhenti di `queued`, bukan ditandai sukses.
 
 Karena pemakaiannya satu HP bergantian, sistem memakai satu device aktif. Bila
-lebih dari satu perangkat tersambung, UI menampilkan pemilih kecil.
+lebih dari satu perangkat tersambung, UI menampilkan pemilih kecil di bar atas
+untuk memilih perangkat mana yang aktif (endpoint `POST /api/device/select`);
+pin dilepas otomatis bila perangkat itu tercabut. Setiap aksi dicatat, termasuk
+pembatalan job yang masih `queued` (`Cancel` memanggil callback riwayat).
 
 ## 6. Antarmuka pengguna
 
@@ -223,7 +226,10 @@ proses). Dengan itu:
 - `queue` diuji urutan, pembatalan, dan perilaku saat satu job gagal.
 - `store` diuji penulisan riwayat dan ekspor.
 - `httpapi` diuji lewat `httptest`, termasuk aliran event SSE.
-- `apkmeta` diuji dengan berkas APK contoh kecil yang disimpan di repo.
+- `apkmeta` diuji dengan APK kecil. Fixture tidak disimpan di repo: tes
+  membangunnya saat berjalan dari `AndroidManifest.xml` biner bawaan modul
+  `apkparser`. Berkas `testdata/mini.apk` hanya diperiksa bila ada, dan
+  di-skip bila tidak.
 
 **Dengan perangkat sungguhan (checklist rilis).** Pasang satu APK contoh,
 pastikan muncul di daftar terpasang, tarik APK-nya, lalu copot. Termasuk uji
@@ -234,9 +240,10 @@ mencabut kabel di tengah instalasi.
 Workflow GitHub Actions berjalan pada matriks Windows, Linux, macOS. Pada tag
 `v*`:
 
-1. Unduh platform-tools untuk OS tersebut, lalu tanam `adb` ke dalam biner
-   (tiap OS memakai berkas `adb` sendiri, ditanam lewat mekanisme khusus Go
-   dengan build tag per OS).
+1. Unduh platform-tools untuk OS tersebut, lalu tanam `adb` ke dalam biner.
+   Semua biner platform disimpan di bawah `internal/bundle/bin/<os>-<arch>/`
+   dan ditanam lewat `go:embed`; direktori platform yang sesuai dipilih saat
+   runtime, bukan lewat build tag per OS.
 2. Jalankan seluruh pengujian.
 3. Hasilkan paket `.zip` (Windows) dan `.tar.gz` (Linux/macOS).
 4. Unggah otomatis ke halaman Releases.

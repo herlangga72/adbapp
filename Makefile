@@ -1,6 +1,8 @@
 BINARY := adbapp
 GOOS   ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
+# Versi platform-tools ini harus tetap sinkron dengan PT_VERSION di
+# .github/workflows/release.yml.
 PT_V   := 35.0.2
 
 PLATFORM := $(GOOS)-$(GOARCH)

@@ -2965,6 +2965,61 @@ func TestOthersEmptyForSingleDevice(t *testing.T) {
 	}
 }
 
+func TestSelectPinsChosenDevice(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+	}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 1: got %q, mau S1", got)
+	}
+	if err := m.Select("S2"); err != nil {
+		t.Fatalf("Select gagal: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S2" {
+		t.Fatalf("setelah pilih: got %q, mau S2", got)
+	}
+}
+
+func TestSelectClearedWhenDeviceDisappears(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		// S2 dicabut: pin harus dilepas dan pilihan jatuh ke S1.
+		{{Serial: "S1", State: "device"}},
+	}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Select("S2"); err != nil {
+		t.Fatalf("Select gagal: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("got %q, mau S1", got)
+	}
+	// Pin sudah dilepas, jadi serial lama sekarang tidak dikenal.
+	if err := m.Select("S2"); err == nil {
+		t.Fatal("Select S2 seharusnya error setelah pin dilepas")
+	}
+}
+
+func TestSelectUnknownSerialErrors(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
+	if err := m.Select("hantu"); err == nil {
+		t.Fatal("Select serial tak dikenal seharusnya error")
+	}
+}
+
 func TestRefreshErrorLeavesCurrentUnchanged(t *testing.T) {
 	l := &fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}}
 	m := New(l)
@@ -3085,6 +3140,8 @@ package device
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -3137,6 +3194,7 @@ type Monitor struct {
 	versionGetter VersionGetter
 	mu            sync.RWMutex
 	current       Status
+	selected      string
 	versions      map[string]string
 }
 
@@ -3159,7 +3217,17 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 		return err
 	}
 	m.mu.Lock()
-	st := pick(devices, m.current.Serial)
+	preferred := m.current.Serial
+	if m.selected != "" {
+		if isReadySerial(devices, m.selected) {
+			preferred = m.selected
+		} else {
+			// Pin mengarah ke perangkat yang sudah hilang atau tidak siap:
+			// lepaskan supaya pilihan kembali lengket ke perangkat aktif.
+			m.selected = ""
+		}
+	}
+	st := pick(devices, preferred)
 	m.current = st
 	var fetchSerial string
 	needFetch := false
@@ -3186,6 +3254,39 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 		m.mu.Unlock()
 	}
 	return nil
+}
+
+// isReadySerial melaporkan apakah serial ada di daftar dan berstatus "device".
+func isReadySerial(devices []adbx.Device, serial string) bool {
+	for _, d := range devices {
+		if d.Serial == serial && d.State == "device" {
+			return true
+		}
+	}
+	return false
+}
+
+// Select memilih perangkat aktif secara eksplisit. Serial harus dikenal pada
+// status terakhir (perangkat aktif atau salah satu pada Others); selain itu
+// dikembalikan error. Pin dihormati oleh Refresh selama perangkat itu hadir dan
+// siap, lalu dilepas otomatis bila menghilang.
+func (m *Monitor) Select(serial string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if serial == "" {
+		return errors.New("serial kosong")
+	}
+	if serial == m.current.Serial {
+		m.selected = serial
+		return nil
+	}
+	for _, s := range m.current.Others {
+		if s == serial {
+			m.selected = serial
+			return nil
+		}
+	}
+	return fmt.Errorf("perangkat %s tidak dikenal", serial)
 }
 
 func pick(devices []adbx.Device, preferred string) Status {
@@ -5114,6 +5215,11 @@ func (q *Queue) Cancel(id string) error {
 		snap := *job
 		q.mu.Unlock()
 		q.broadcast(snap)
+		// Setiap aksi harus tercatat di riwayat, termasuk pembatalan saat masih
+		// menunggu. Bentuk argumen disamakan dengan jalur job berjalan.
+		if q.onDone != nil {
+			q.onDone(snap, context.Canceled)
+		}
 		return nil
 	case StatusRunning:
 		cancel := q.cancels[id]
@@ -5229,6 +5335,12 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 	case err != nil && errors.Is(err, context.Canceled):
 		job.Status = StatusCancelled
 		job.Message = "dibatalkan"
+	case err != nil && errors.Is(err, adbx.ErrDeviceNotFound):
+		// Perangkat dicabut di tengah proses: beri pesan yang lebih jelas, tetapi
+		// error asli tetap disimpan agar bisa ditelusuri.
+		job.Status = StatusFailed
+		job.Message = "perangkat terputus"
+		job.Error = err.Error()
 	case err != nil:
 		job.Status = StatusFailed
 		job.Error = err.Error()
@@ -5375,10 +5487,39 @@ import (
 	"github.com/herlangga72/adbapp/internal/store"
 )
 
-type fakeDevice struct{ status device.Status }
+type fakeDevice struct {
+	status   device.Status
+	selected string
+}
 
-func (f fakeDevice) Current() device.Status            { return f.status }
-func (f fakeDevice) Refresh(ctx context.Context) error { return nil }
+func (f *fakeDevice) Current() device.Status            { return f.status }
+func (f *fakeDevice) Refresh(ctx context.Context) error { return nil }
+
+// Select meniru Monitor.Select: hanya serial yang dikenal yang diterima, lalu
+// perangkat itu dijadikan yang aktif.
+func (f *fakeDevice) Select(serial string) error {
+	all := append([]string{f.status.Serial}, f.status.Others...)
+	found := false
+	for _, s := range all {
+		if s == serial {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("perangkat %s tidak dikenal", serial)
+	}
+	f.selected = serial
+	f.status.Serial = serial
+	others := []string{}
+	for _, s := range all {
+		if s != serial {
+			others = append(others, s)
+		}
+	}
+	f.status.Others = others
+	return nil
+}
 
 type fakeQueue struct{ enqueued []queue.Job }
 
@@ -5419,7 +5560,7 @@ func newTestServer(t *testing.T) (*Server, *fakeQueue) {
 	t.Helper()
 	fq := &fakeQueue{}
 	s := &Server{
-		Device:  fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
+		Device:  &fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
 		Queue:   fq,
 		History: &fakeHistory{entries: []store.Entry{{Action: "install", Package: "com.foo", Success: true}}},
 		Adb:     fakeAdb{},
@@ -5522,7 +5663,7 @@ func TestLocalOnlyRejectsForeignHost(t *testing.T) {
 	}
 }
 
-func TestUploadSavesFile(t *testing.T) {
+func TestUploadRejectsCorruptAPK(t *testing.T) {
 	s, _ := newTestServer(t)
 	if err := s.Paths.Ensure(); err != nil {
 		t.Fatal(err)
@@ -5535,16 +5676,20 @@ func TestUploadSavesFile(t *testing.T) {
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=batas")
 	s.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	// Berkas yang bukan APK sah ditolak dan tidak ditinggalkan di folder.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d body %s", rec.Code, rec.Body.String())
 	}
-	var got apkEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("JSON tidak sah: %v", err)
-	}
-	want := filepath.Join(s.Paths.UploadsDir, "contoh.apk")
-	if got.Path != want {
-		t.Fatalf("path salah: got %q want %q", got.Path, want)
+}
+
+func TestSelectDeviceUnknownSerial(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/device/select", strings.NewReader(`{"serial":"tidak-ada"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("harus 404, dapat %d body %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -5604,6 +5749,7 @@ import (
 type DeviceSource interface {
 	Current() device.Status
 	Refresh(ctx context.Context) error
+	Select(serial string) error
 }
 
 type JobQueue interface {
@@ -5640,6 +5786,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/device/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/device/select", s.handleSelectDevice)
 	mux.HandleFunc("GET /api/apks", s.handleListAPKs)
 	mux.HandleFunc("POST /api/apks/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/apks/url", s.handleFromURL)
@@ -5705,6 +5852,31 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if err := s.Device.Refresh(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Device.Current())
+}
+
+// handleSelectDevice memilih perangkat aktif ketika lebih dari satu tersambung.
+// Serial yang tidak dikenal dibalas 404; serial kosong dibalas 400.
+func (s *Server) handleSelectDevice(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Serial string `json:"serial"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("badan permintaan tidak sah: %w", err))
+		return
+	}
+	if strings.TrimSpace(req.Serial) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("serial wajib diisi"))
+		return
+	}
+	if err := s.Device.Select(req.Serial); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
 	if err := s.Device.Refresh(r.Context()); err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -5946,6 +6118,7 @@ type apkEntry struct {
 	Package     string `json:"package,omitempty"`
 	VersionName string `json:"versionName,omitempty"`
 	VersionCode int64  `json:"versionCode,omitempty"`
+	MinSDK      int    `json:"minSdk,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
 
@@ -5966,6 +6139,7 @@ func (s *Server) entryFor(path string) apkEntry {
 	e.Package = meta.Package
 	e.VersionName = meta.VersionName
 	e.VersionCode = meta.VersionCode
+	e.MinSDK = meta.MinSDK
 	return e
 }
 
@@ -6040,6 +6214,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := s.entryFor(dest)
+	if entry.Error != "" {
+		// Berkas yang bukan APK yang sah ditolak di sini, sama seperti jalur URL,
+		// dan tidak ditinggalkan di folder unggahan (spec 7).
+		_ = os.Remove(dest)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("berkas bukan APK yang sah: %s", entry.Error))
+		return
+	}
 	writeJSON(w, http.StatusOK, entry)
 }
 
@@ -6232,6 +6413,7 @@ Create `internal/webui/static/index.html`:
   <div class="device">
     <span id="dot" class="dot"></span>
     <span id="device-label">Memeriksa perangkat...</span>
+    <select id="device-select" class="hidden" aria-label="Pilih perangkat"></select>
   </div>
   <button id="refresh" class="secondary">Pindai ulang</button>
 </header>
@@ -6267,7 +6449,7 @@ Create `internal/webui/static/index.html`:
 
     <table id="apk-table">
       <thead>
-        <tr><th></th><th>Berkas</th><th>Paket</th><th>Versi</th><th>Ukuran</th></tr>
+        <tr><th></th><th>Berkas</th><th>Paket</th><th>Versi</th><th>minSdk</th><th>Ukuran</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -6464,6 +6646,20 @@ Create `internal/webui/static/app.js`:
 'use strict';
 
 const $ = (id) => document.getElementById(id);
+
+// escapeHtml mengubah karakter khusus HTML menjadi entitas. Semua nilai yang
+// berasal dari perangkat atau berkas pengguna harus dilewatkan helper ini
+// sebelum masuk innerHTML, supaya nama berkas yang jahat tidak menyuntikkan
+// skrip (stored XSS).
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 const state = {
   apks: [],
   packages: [],
@@ -6474,6 +6670,7 @@ const state = {
   selectedPkgs: new Set(),
   jobs: new Map(),
   deviceReady: false,
+  selectedDevice: '',
 };
 
 function toast(message, isError) {
@@ -6557,8 +6754,34 @@ function renderDevice(status) {
     hint.classList.remove('hidden');
   }
   updateActionButtons();
+  renderDevicePicker(status);
   renderApks();
   renderPackages();
+}
+
+// renderDevicePicker menampilkan pemilih perangkat kecil saat lebih dari satu
+// perangkat tersambung (atau saat pengguna sudah memilih salah satunya).
+function renderDevicePicker(status) {
+  const sel = $('device-select');
+  const serials = [status.serial, ...(status.others || [])].filter(Boolean);
+  const show = (status.others && status.others.length > 0) || !!state.selectedDevice;
+  if (!show || serials.length === 0) {
+    sel.classList.add('hidden');
+    sel.innerHTML = '';
+    return;
+  }
+  if (state.selectedDevice && !serials.includes(state.selectedDevice)) {
+    state.selectedDevice = '';
+  }
+  sel.classList.remove('hidden');
+  sel.innerHTML = '';
+  serials.forEach((serial) => {
+    const opt = document.createElement('option');
+    opt.value = serial;
+    opt.textContent = serial;
+    if (serial === (state.selectedDevice || status.serial)) opt.selected = true;
+    sel.appendChild(opt);
+  });
 }
 
 function renderApks() {
@@ -6569,9 +6792,10 @@ function renderApks() {
     if (state.selectedApks.has(apk.path)) tr.classList.add('selected');
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedApks.has(apk.path) ? 'checked' : ''}></td>
-      <td>${apk.name}</td>
-      <td>${apk.package || '<span class="muted">tidak terbaca</span>'}</td>
-      <td>${apk.versionName || '-'}</td>
+      <td>${escapeHtml(apk.name)}</td>
+      <td>${apk.package ? escapeHtml(apk.package) : '<span class="muted">tidak terbaca</span>'}</td>
+      <td>${escapeHtml(apk.versionName || '-')}</td>
+      <td>${apk.minSdk || '-'}</td>
       <td>${humanSize(apk.size)}</td>`;
     if (apk.error) tr.title = apk.error;
     tr.querySelector('input').addEventListener('change', (e) => {
@@ -6632,10 +6856,10 @@ function renderPackages() {
     const detail = detailFor(pkg.name);
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedPkgs.has(pkg.name) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
-      <td>${pkg.name} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
-      <td>${pkg.versionCode || '-'}</td>
+      <td>${escapeHtml(pkg.name)} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
+      <td>${escapeHtml(pkg.versionCode || '-')}</td>
       <td>${detail ? humanSize(detail.sizeBytes) : '-'}</td>
-      <td>${detail?.installTime || '-'}</td>
+      <td>${escapeHtml(detail?.installTime || '-')}</td>
       <td class="row-actions">
         <button class="secondary" data-act="detail">Detail</button>
         <button class="danger" data-act="uninstall" ${locked || !ready ? 'disabled' : ''}>Copot</button>
@@ -6678,14 +6902,14 @@ async function showDetail(name) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ package: name }),
     });
-    el.innerHTML = `<h3>${info.package}</h3>
+    el.innerHTML = `<h3>${escapeHtml(info.package)}</h3>
       <dl>
-        <dt>Versi</dt><dd>${info.versionName || '-'} (kode ${info.versionCode || '-'})</dd>
+        <dt>Versi</dt><dd>${escapeHtml(info.versionName || '-')} (kode ${escapeHtml(info.versionCode || '-')})</dd>
         <dt>Ukuran data</dt><dd>${humanSize(info.sizeBytes)}</dd>
-        <dt>Terpasang</dt><dd>${info.installTime || '-'}</dd>
-        <dt>Diperbarui</dt><dd>${info.updateTime || '-'}</dd>
-        <dt>APK</dt><dd>${info.apkPath || '-'}</dd>
-        <dt>Izin</dt><dd>${(info.permissions || []).join('<br>') || '-'}</dd>
+        <dt>Terpasang</dt><dd>${escapeHtml(info.installTime || '-')}</dd>
+        <dt>Diperbarui</dt><dd>${escapeHtml(info.updateTime || '-')}</dd>
+        <dt>APK</dt><dd>${escapeHtml(info.apkPath || '-')}</dd>
+        <dt>Izin</dt><dd>${(info.permissions || []).map(escapeHtml).join('<br>') || '-'}</dd>
       </dl>`;
   } catch (err) {
     el.textContent = 'Gagal memuat detail: ' + err.message;
@@ -6740,10 +6964,10 @@ function renderJobs() {
     const li = document.createElement('li');
     const running = job.status === 'running' || job.status === 'queued';
     li.innerHTML = `
-      <div><strong>${job.label || job.target}</strong>
-        <span class="status-${job.status}">${job.status}</span></div>
-      <div class="meta">${job.message || ''} ${job.error ? '· ' + job.error : ''} ${job.result ? '· ' + job.result : ''}</div>
-      <div class="progress"><span style="width:${job.status === 'success' ? 100 : job.progress || 0}%"></span></div>
+      <div><strong>${escapeHtml(job.label || job.target)}</strong>
+        <span class="status-${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>
+      <div class="meta">${escapeHtml(job.message || '')} ${job.error ? '· ' + escapeHtml(job.error) : ''} ${job.result ? '· ' + escapeHtml(job.result) : ''}</div>
+      <div class="progress"><span style="width:${job.status === 'success' ? 100 : (Number(job.progress) || 0)}%"></span></div>
       ${running ? '<button class="secondary" data-cancel>Batalkan</button>' : ''}`;
     if (running) {
       li.querySelector('[data-cancel]').addEventListener('click', () => {
@@ -6798,10 +7022,10 @@ function renderHistory() {
       .some((f) => (f || '').toLowerCase().includes(term)))
     .forEach((e) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${new Date(e.time).toLocaleString('id-ID')}</td>
-        <td>${e.action}</td><td>${e.package || '-'}</td>
+      tr.innerHTML = `<td>${escapeHtml(new Date(e.time).toLocaleString('id-ID'))}</td>
+        <td>${escapeHtml(e.action)}</td><td>${escapeHtml(e.package || '-')}</td>
         <td class="${e.success ? 'status-success' : 'status-failed'}">${e.success ? 'sukses' : 'gagal'}</td>
-        <td>${e.detail || ''}</td>`;
+        <td>${escapeHtml(e.detail || '')}</td>`;
       tbody.appendChild(tr);
     });
 }
@@ -6895,6 +7119,21 @@ function setupBottomToggle() {
 function bind() {
   $('refresh').addEventListener('click', () =>
     api('/api/device/refresh', { method: 'POST' }).catch((e) => toast(e.message, true)));
+  $('device-select').addEventListener('change', async (e) => {
+    state.selectedDevice = e.target.value;
+    try {
+      const st = await api('/api/device/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serial: state.selectedDevice }),
+      });
+      renderDevice(st);
+      loadPackages();
+    } catch (err) {
+      toast(err.message, true);
+      state.selectedDevice = '';
+    }
+  });
   $('load-folder').addEventListener('click', async () => {
     const folder = $('folder').value.trim();
     if (!folder) { toast('Isi dulu folder koleksi', true); return; }
@@ -7690,9 +7929,9 @@ git push origin master
 | Copot, copot simpan data, hapus data, tarik APK | Task 6, Task 10, Task 11, Task 12 |
 | Detail paket (versi, ukuran, izin) | Task 5, Task 11, Task 12 |
 | Bulk uninstall + konfirmasi | Task 11, Task 12 |
-| Riwayat permanen + ekspor CSV/JSON | Task 9, Task 11, Task 12 |
+| Riwayat permanen + ekspor CSV/JSON | Task 9, Task 11, Task 12 (termasuk pembatalan `queued` lewat `onDone`) |
 | Pesan error yang jelas | Task 4, Task 6, Task 12 (panel petunjuk) |
-| Satu perangkat aktif + pemilih bila lebih | Task 7 (`Others`) |
+| Satu perangkat aktif + pemilih bila lebih | Task 7 (`Others`, `Select`), Task 11 (`/api/device/select`), Task 12 (pemilih) |
 | Paket per OS + adb tertanam + CI | Task 2, Task 14 |
 | Pemasangan `curl` di macOS | Task 14 (arsip), Task 15 (README) |
 | Pengujian tanpa perangkat | Task 3-11 |
@@ -7702,12 +7941,17 @@ git push origin master
 
 - `adbx.InstallOptions{Replace, AllowDowngrade, GrantAll}`, `adbx.StageFunc`
   dipakai konsisten di Task 3, 6, 10, 11, 13.
-- `queue.Job` dan `queue.Status*`/`queue.Kind*` konsisten antara Task 10, 11, 13.
-- `device.Status{State, Serial, Model, Others}` konsisten di Task 7, 11, 12, 13.
+- `queue.Job` dan `queue.Status*`/`queue.Kind*` konsisten antara Task 10, 11, 13;
+  `Cancel` job `queued` juga memanggil `onDone` agar riwayat lengkap.
+- `device.Status{State, Serial, Model, AndroidVersion, Others}` dan
+  `Monitor.Select(serial)` konsisten di Task 7, 11, 12, 13.
 - `store.Entry{Time, Action, Package, Device, Success, Detail}` konsisten di
   Task 9, 11, 13.
 - `apkmeta.Meta{Package, VersionName, Label, VersionCode, MinSDK}` dan
-  `ReadCached(path, size, modUnixNano)` konsisten di Task 8 dan 11.
+  `ReadCached(path, size, modUnixNano)` konsisten di Task 8 dan 11; `minSdk`
+  disalurkan ke `httpapi.apkEntry` dan kolom tab Pasang.
+- `httpapi.DeviceSource` memuat `Current`, `Refresh`, dan `Select`, cocok dengan
+  `device.Monitor` di Task 7 dan 13.
 - `paths.Paths` konsisten di Task 1, 11, 13.
 - Nama SSE: `event: state` dan `event: job` cocok antara Task 11 (server) dan
   Task 12 (client).

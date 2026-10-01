@@ -48,6 +48,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Versi ini harus tetap sinkron dengan PT_V di Makefile.
           PT_VERSION=35.0.2
           PT_OS="${{ matrix.platform_tools }}"
           # adb.exe di Windows memuat AdbWinApi.dll secara statis, jadi DLL itu
