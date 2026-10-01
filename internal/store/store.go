@@ -85,7 +85,7 @@ func (s *Store) Read(limit int) ([]Entry, error) {
 
 	var all []Entry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -111,10 +111,16 @@ func (s *Store) Read(limit int) ([]Entry, error) {
 // tailChunkSize adalah ukuran tiap potongan saat membaca mundur dari ekor.
 const tailChunkSize = 64 * 1024
 
-// readTail membaca paling banyak limit baris terakhir berkas dan
-// mengembalikannya terbaru lebih dulu. Baris yang lebih panjang dari
-// tailChunkSize tetap utuh karena potongan terus dibaca sampai baris lengkap
-// terkumpul.
+// maxLineSize adalah batas panjang satu baris pada jalur baca penuh. Nilai ini
+// cukup besar untuk menampung Detail yang panjang (mis. dump adb) tanpa
+// menggagalkan pemindaian.
+const maxLineSize = 8 * 1024 * 1024
+
+// readTail mengembalikan paling banyak limit entri terakhir berkas, terbaru
+// lebih dulu. Baris yang lebih panjang dari tailChunkSize tetap utuh karena
+// potongan terus dibaca sampai baris lengkap terkumpul. Pembacaan mundur
+// berlanjut melewati baris rusak sampai terkumpul limit entri yang benar-benar
+// dapat di-parse, atau sampai awal berkas.
 func readTail(f *os.File, limit int) ([]Entry, error) {
 	info, err := f.Stat()
 	if err != nil {
@@ -125,14 +131,15 @@ func readTail(f *os.File, limit int) ([]Entry, error) {
 		return nil, nil
 	}
 
-	// Baca mundur dalam potongan sampai cukup banyak pemisah baris terkumpul
-	// (atau sampai awal berkas). Satu pemisah ekstra memastikan baris terdepan
-	// yang dipertahankan berada tepat setelah newline, jadi utuh meskipun
-	// potongan pertama dimulai di tengah baris. Potongan disimpan lalu
-	// disatukan sekali agar tidak menyalin buffer berulang kali.
-	var chunks [][]byte
-	newlines := 0
-	for pos := size; pos > 0 && newlines < limit+1; {
+	// Kumpulkan potongan dari ekor sampai cukup banyak entri sah. Jumlah
+	// baris baru dipakai sebagai batas atas murah: selama newline belum
+	// mencapai limit, mustahil ada limit entri sah, jadi tidak perlu parse.
+	// Batas ini juga aman untuk limit == math.MaxInt karena tidak pernah
+	// dihitung limit+1 yang bisa meluap.
+	var buf []byte
+	var newlines int64
+	pos := size
+	for pos > 0 {
 		n := int64(tailChunkSize)
 		if pos < n {
 			n = pos
@@ -142,17 +149,15 @@ func readTail(f *os.File, limit int) ([]Entry, error) {
 		if _, err := f.ReadAt(chunk, pos); err != nil {
 			return nil, err
 		}
-		chunks = append(chunks, chunk)
-		newlines += bytes.Count(chunk, newline)
-	}
-
-	total := 0
-	for _, c := range chunks {
-		total += len(c)
-	}
-	buf := make([]byte, 0, total)
-	for i := len(chunks) - 1; i >= 0; i-- {
-		buf = append(buf, chunks[i]...)
+		// chunk mendahului buf karena dibaca lebih dekat ke awal berkas.
+		buf = append(chunk, buf...)
+		newlines += int64(bytes.Count(chunk, newline))
+		if newlines < int64(limit) {
+			continue
+		}
+		if countParsedLines(buf, pos > 0) >= limit {
+			break
+		}
 	}
 
 	lines := bytes.Split(buf, newline)
@@ -160,14 +165,17 @@ func readTail(f *os.File, limit int) ([]Entry, error) {
 	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
 		lines = lines[:len(lines)-1]
 	}
-	// Potongan pertama bisa dimulai di tengah baris; ambil hanya limit baris
-	// terakhir yang pasti utuh.
-	if len(lines) > limit {
-		lines = lines[len(lines)-limit:]
+	// Bila pembacaan berhenti sebelum awal berkas, segmen pertama bisa
+	// dimulai di tengah baris; buang agar sisa segmen pasti utuh.
+	if pos > 0 && len(lines) > 0 {
+		lines = lines[1:]
 	}
 
+	// Telusuri dari ekor agar entri terbaru lebih dulu, melewati baris rusak,
+	// sampai limit entri terkumpul.
 	var entries []Entry
-	for _, line := range lines {
+	for i := len(lines) - 1; i >= 0 && len(entries) < limit; i-- {
+		line := lines[i]
 		if len(line) == 0 {
 			continue
 		}
@@ -177,11 +185,28 @@ func readTail(f *os.File, limit int) ([]Entry, error) {
 		}
 		entries = append(entries, e)
 	}
-	// Balik urutan: terbaru lebih dulu.
-	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
-		entries[i], entries[j] = entries[j], entries[i]
-	}
 	return entries, nil
+}
+
+// countParsedLines menghitung baris pada buf yang berhasil di-parse. Bila
+// skipFirst benar, segmen pertama diabaikan karena potongan pembacaan bisa
+// dimulai di tengah baris sehingga segmen itu tidak utuh.
+func countParsedLines(buf []byte, skipFirst bool) int {
+	lines := bytes.Split(buf, newline)
+	if skipFirst && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	n := 0
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		var e Entry
+		if json.Unmarshal(line, &e) == nil {
+			n++
+		}
+	}
+	return n
 }
 
 // ExportCSV menulis seluruh riwayat sebagai CSV.

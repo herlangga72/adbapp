@@ -56,9 +56,9 @@ func resetCache() {
 	cacheMu.Unlock()
 }
 
-// fixtureAPK membangun APK minimal: arsip zip berisi AndroidManifest.xml
-// biner. Berkas dibuat sekali di TestMain agar tidak perlu biner besar
-// di dalam repo.
+// TestReadFixture membaca fixture testdata/mini.apk bila tersedia dan
+// memeriksa package beserta versionName-nya. Tes di-skip bila fixture belum
+// disediakan.
 func TestReadFixture(t *testing.T) {
 	path := filepath.Join("testdata", "mini.apk")
 	if _, err := os.Stat(path); err != nil {

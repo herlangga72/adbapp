@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -363,5 +364,87 @@ func TestReadTailLineLongerThanChunk(t *testing.T) {
 	}
 	if len(got) != 2 || got[1].Package != "big" || got[1].Detail != big {
 		t.Fatalf("baris panjang tidak terbaca utuh: len=%d", len(got))
+	}
+}
+
+func TestReadTailRefillsPastCorruptLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 200; i++ {
+		if err := s.Append(Entry{Package: fmt.Sprintf("pkg-%03d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Baris rusak di paling ekor tidak boleh membuat Read(limit) kekurangan
+	// entri: pembacaan harus mundur sampai limit entri sah terkumpul.
+	if err := appendRaw(path, "{ini bukan json}\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pkg-199", "pkg-198", "pkg-197", "pkg-196", "pkg-195"}
+	if len(got) != len(want) {
+		t.Fatalf("harus %d entri sah, dapat %d: %+v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i].Package != want[i] {
+			t.Fatalf("urutan salah di %d: got %q mau %q", i, got[i].Package, want[i])
+		}
+	}
+}
+
+func TestReadHugeLimitNoOverflow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 3; i++ {
+		if err := s.Append(Entry{Package: fmt.Sprintf("pkg-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// limit == math.MaxInt tidak boleh meluap atau panik; artinya baca semua.
+	got, err := s.Read(math.MaxInt)
+	if err != nil {
+		t.Fatalf("Read(math.MaxInt) gagal: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("harus 3 entri, dapat %d: %+v", len(got), got)
+	}
+	if got[0].Package != "pkg-2" {
+		t.Fatalf("terbaru harus pkg-2, dapat %q", got[0].Package)
+	}
+}
+
+func TestReadFullHandlesLongDetailAndExport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	// ~2 MB, jauh di atas buffer scanner lama (1 MB) tetapi di bawah batas
+	// baru (8 MB).
+	big := strings.Repeat("d", 2*1024*1024)
+	if err := s.Append(Entry{Package: "big", Detail: big, Success: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(0)
+	if err != nil {
+		t.Fatalf("Read(0) gagal untuk Detail panjang: %v", err)
+	}
+	if len(got) != 1 || got[0].Detail != big {
+		t.Fatalf("Detail panjang tidak bulat: len=%d", len(got))
+	}
+
+	var csvBuf bytes.Buffer
+	if err := s.ExportCSV(&csvBuf); err != nil {
+		t.Fatalf("ExportCSV gagal: %v", err)
+	}
+	if !strings.Contains(csvBuf.String(), big) {
+		t.Fatal("CSV tidak memuat Detail panjang")
+	}
+	var jsonBuf bytes.Buffer
+	if err := s.ExportJSON(&jsonBuf); err != nil {
+		t.Fatalf("ExportJSON gagal: %v", err)
+	}
+	if !strings.Contains(jsonBuf.String(), big) {
+		t.Fatal("JSON tidak memuat Detail panjang")
 	}
 }
