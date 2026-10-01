@@ -4349,7 +4349,9 @@ Create `internal/queue/queue_test.go`:
 package queue
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -4360,10 +4362,11 @@ import (
 )
 
 type fakeRunner struct {
-	mu    sync.Mutex
-	calls []string
-	fail  map[string]error
-	block chan struct{}
+	mu          sync.Mutex
+	calls       []string
+	fail        map[string]error
+	block       chan struct{}
+	interrupted chan struct{}
 }
 
 func newFakeRunner() *fakeRunner {
@@ -4392,6 +4395,9 @@ func (f *fakeRunner) Install(ctx context.Context, apkPath string, opts adbx.Inst
 		select {
 		case <-f.block:
 		case <-ctx.Done():
+			if f.interrupted != nil {
+				close(f.interrupted)
+			}
 			return ctx.Err()
 		}
 	}
@@ -4425,6 +4431,20 @@ func (f *fakeRunner) PullApk(ctx context.Context, pkg string, destDir string) (s
 		return "", err
 	}
 	return destDir + "/" + pkg + ".apk", nil
+}
+
+// slowSuccessRunner meniru runner yang tetap mengembalikan sukses meski
+// konteksnya dibatalkan, untuk menguji cabang finalisasi cancelled.
+type slowSuccessRunner struct {
+	fakeRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *slowSuccessRunner) Install(ctx context.Context, apkPath string, opts adbx.InstallOptions, stage adbx.StageFunc) error {
+	close(r.started)
+	<-r.release
+	return nil
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -4682,6 +4702,127 @@ func TestSubscribeDeliversAndUnsubscribeIsIdempotent(t *testing.T) {
 		t.Fatalf("saluran pelanggan lambat seharusnya penuh: len=%d cap=%d", len(slowCh), cap(slowCh))
 	}
 }
+
+func TestRunJobSkipsNonQueuedJob(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	job := &Job{ID: "selesai", Kind: KindInstall, Target: "/tmp/selesai.apk", Status: StatusCancelled}
+
+	q.runJob(context.Background(), job)
+
+	if got := job.Status; got != StatusCancelled {
+		t.Fatalf("job non-queued harus tetap cancelled, dapat %v", got)
+	}
+	if got := fr.sequence(); len(got) != 0 {
+		t.Fatalf("runner tidak boleh dipanggil untuk job non-queued, dapat %v", got)
+	}
+}
+
+func TestCancelledJobStaysCancelledWhenRunnerSucceeds(t *testing.T) {
+	fr := &slowSuccessRunner{started: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan Job, 1)
+	q := New(fr, WithOnDone(func(j Job, err error) { done <- j }))
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	select {
+	case <-fr.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner tidak mulai")
+	}
+	if err := q.Cancel(a.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+	close(fr.release)
+
+	select {
+	case final := <-done:
+		if final.Status != StatusCancelled {
+			t.Fatalf("status akhir harus cancelled, dapat %v", final.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("job tidak selesai setelah runner dilepas")
+	}
+}
+
+func TestCancelRunningInterruptsRunner(t *testing.T) {
+	fr := newFakeRunner()
+	fr.block = make(chan struct{})
+	fr.interrupted = make(chan struct{})
+	q := New(fr)
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	waitFor(t, "job berjalan", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusRunning
+	})
+	if err := q.Cancel(a.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+
+	select {
+	case <-fr.interrupted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner tidak menerima sinyal pembatalan")
+	}
+	waitFor(t, "job akhir cancelled", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusCancelled
+	})
+}
+
+func TestSubscriberSeesLifecycle(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+
+	ch, unsubscribe := q.Subscribe()
+	defer unsubscribe()
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/life.apk"})
+
+	sawRunning := false
+	sawTerminal := false
+	deadline := time.After(3 * time.Second)
+	for !sawRunning || !sawTerminal {
+		select {
+		case j, ok := <-ch:
+			if !ok {
+				t.Fatal("saluran langganan ditutup sebelum siklus penuh")
+			}
+			if j.ID != a.ID {
+				continue
+			}
+			switch j.Status {
+			case StatusRunning:
+				sawRunning = true
+			case StatusSuccess, StatusFailed, StatusCancelled:
+				sawTerminal = true
+			}
+		case <-deadline:
+			t.Fatalf("siklus tidak lengkap: running=%v terminal=%v", sawRunning, sawTerminal)
+		}
+	}
+}
+
+func TestJobJSONOmitsUnsetTimestamps(t *testing.T) {
+	queued, err := json.Marshal(Job{ID: "x", Kind: KindInstall, Status: StatusQueued})
+	if err != nil {
+		t.Fatalf("marshal job queued: %v", err)
+	}
+	if bytes.Contains(queued, []byte("startedAt")) || bytes.Contains(queued, []byte("endedAt")) {
+		t.Fatalf("job queued tidak boleh memuat timestamp: %s", queued)
+	}
+
+	started := time.Now()
+	ended := started.Add(time.Second)
+	done, err := json.Marshal(Job{ID: "x", Kind: KindInstall, Status: StatusSuccess, StartedAt: &started, EndedAt: &ended})
+	if err != nil {
+		t.Fatalf("marshal job selesai: %v", err)
+	}
+	if !bytes.Contains(done, []byte("startedAt")) || !bytes.Contains(done, []byte("endedAt")) {
+		t.Fatalf("job selesai harus memuat timestamp: %s", done)
+	}
+}
 ```
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
@@ -4729,21 +4870,21 @@ const (
 
 // Job adalah satu pekerjaan di antrean.
 type Job struct {
-	ID             string    `json:"id"`
-	Kind           Kind      `json:"kind"`
-	Target         string    `json:"target"`
-	Label          string    `json:"label,omitempty"`
-	DestDir        string    `json:"destDir,omitempty"`
-	Replace        bool      `json:"replace,omitempty"`
-	AllowDowngrade bool      `json:"allowDowngrade,omitempty"`
-	Status         Status    `json:"status"`
-	Progress       int       `json:"progress"`
-	Message        string    `json:"message,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	Result         string    `json:"result,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	StartedAt      time.Time `json:"startedAt,omitempty"`
-	EndedAt        time.Time `json:"endedAt,omitempty"`
+	ID             string     `json:"id"`
+	Kind           Kind       `json:"kind"`
+	Target         string     `json:"target"`
+	Label          string     `json:"label,omitempty"`
+	DestDir        string     `json:"destDir,omitempty"`
+	Replace        bool       `json:"replace,omitempty"`
+	AllowDowngrade bool       `json:"allowDowngrade,omitempty"`
+	Status         Status     `json:"status"`
+	Progress       int        `json:"progress"`
+	Message        string     `json:"message,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	Result         string     `json:"result,omitempty"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	StartedAt      *time.Time `json:"startedAt,omitempty"`
+	EndedAt        *time.Time `json:"endedAt,omitempty"`
 }
 
 // Runner adalah kemampuan perangkat yang dibutuhkan antrean.
@@ -4847,7 +4988,8 @@ func (q *Queue) Cancel(id string) error {
 	case StatusQueued:
 		job.Status = StatusCancelled
 		job.Message = "dibatalkan sebelum dijalankan"
-		job.EndedAt = time.Now()
+		ended := time.Now()
+		job.EndedAt = &ended
 		snap := *job
 		q.mu.Unlock()
 		q.broadcast(snap)
@@ -4945,7 +5087,8 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 		return
 	}
 	job.Status = StatusRunning
-	job.StartedAt = time.Now()
+	started := time.Now()
+	job.StartedAt = &started
 	job.Message = "Mulai"
 	q.cancels[job.ID] = cancel
 	snap := *job
@@ -4957,7 +5100,8 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 
 	q.mu.Lock()
 	delete(q.cancels, job.ID)
-	job.EndedAt = time.Now()
+	ended := time.Now()
+	job.EndedAt = &ended
 	switch {
 	case job.Status == StatusCancelled:
 		// sudah ditandai oleh Cancel
@@ -5035,6 +5179,11 @@ func (q *Queue) setResult(id, result string) {
 }
 ```
 
+**Catatan timestamp:** `StartedAt` dan `EndedAt` kini bertipe `*time.Time`
+agar `omitempty` benar-benar menghilangkan kedua bidang saat job masih antre;
+field diisi lewat pointer baru (`&started`, `&ended`) dan tidak pernah dimutasi
+melalui pointer bersama.
+
 - [ ] **Step 4: Rapikan tes terakhir yang berlebihan**
 
 Tes `TestUnknownKindFails` memuat pemeriksaan `errors.Is` yang tidak berguna.
@@ -5061,7 +5210,7 @@ dari blok import `queue_test.go`.
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/queue/ -race -v`
-Expected: PASS untuk kesembilan tes, tanpa peringatan race.
+Expected: PASS untuk keempat belas tes, tanpa peringatan race.
 
 - [ ] **Step 6: Commit**
 

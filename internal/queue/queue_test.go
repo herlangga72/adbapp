@@ -1,7 +1,9 @@
 package queue
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,10 +14,11 @@ import (
 )
 
 type fakeRunner struct {
-	mu    sync.Mutex
-	calls []string
-	fail  map[string]error
-	block chan struct{}
+	mu          sync.Mutex
+	calls       []string
+	fail        map[string]error
+	block       chan struct{}
+	interrupted chan struct{}
 }
 
 func newFakeRunner() *fakeRunner {
@@ -44,6 +47,9 @@ func (f *fakeRunner) Install(ctx context.Context, apkPath string, opts adbx.Inst
 		select {
 		case <-f.block:
 		case <-ctx.Done():
+			if f.interrupted != nil {
+				close(f.interrupted)
+			}
 			return ctx.Err()
 		}
 	}
@@ -77,6 +83,20 @@ func (f *fakeRunner) PullApk(ctx context.Context, pkg string, destDir string) (s
 		return "", err
 	}
 	return destDir + "/" + pkg + ".apk", nil
+}
+
+// slowSuccessRunner meniru runner yang tetap mengembalikan sukses meski
+// konteksnya dibatalkan, untuk menguji cabang finalisasi cancelled.
+type slowSuccessRunner struct {
+	fakeRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *slowSuccessRunner) Install(ctx context.Context, apkPath string, opts adbx.InstallOptions, stage adbx.StageFunc) error {
+	close(r.started)
+	<-r.release
+	return nil
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -332,5 +352,126 @@ func TestSubscribeDeliversAndUnsubscribeIsIdempotent(t *testing.T) {
 	}
 	if len(slowCh) != cap(slowCh) {
 		t.Fatalf("saluran pelanggan lambat seharusnya penuh: len=%d cap=%d", len(slowCh), cap(slowCh))
+	}
+}
+
+func TestRunJobSkipsNonQueuedJob(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	job := &Job{ID: "selesai", Kind: KindInstall, Target: "/tmp/selesai.apk", Status: StatusCancelled}
+
+	q.runJob(context.Background(), job)
+
+	if got := job.Status; got != StatusCancelled {
+		t.Fatalf("job non-queued harus tetap cancelled, dapat %v", got)
+	}
+	if got := fr.sequence(); len(got) != 0 {
+		t.Fatalf("runner tidak boleh dipanggil untuk job non-queued, dapat %v", got)
+	}
+}
+
+func TestCancelledJobStaysCancelledWhenRunnerSucceeds(t *testing.T) {
+	fr := &slowSuccessRunner{started: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan Job, 1)
+	q := New(fr, WithOnDone(func(j Job, err error) { done <- j }))
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	select {
+	case <-fr.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner tidak mulai")
+	}
+	if err := q.Cancel(a.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+	close(fr.release)
+
+	select {
+	case final := <-done:
+		if final.Status != StatusCancelled {
+			t.Fatalf("status akhir harus cancelled, dapat %v", final.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("job tidak selesai setelah runner dilepas")
+	}
+}
+
+func TestCancelRunningInterruptsRunner(t *testing.T) {
+	fr := newFakeRunner()
+	fr.block = make(chan struct{})
+	fr.interrupted = make(chan struct{})
+	q := New(fr)
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	waitFor(t, "job berjalan", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusRunning
+	})
+	if err := q.Cancel(a.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+
+	select {
+	case <-fr.interrupted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner tidak menerima sinyal pembatalan")
+	}
+	waitFor(t, "job akhir cancelled", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusCancelled
+	})
+}
+
+func TestSubscriberSeesLifecycle(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+
+	ch, unsubscribe := q.Subscribe()
+	defer unsubscribe()
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/life.apk"})
+
+	sawRunning := false
+	sawTerminal := false
+	deadline := time.After(3 * time.Second)
+	for !sawRunning || !sawTerminal {
+		select {
+		case j, ok := <-ch:
+			if !ok {
+				t.Fatal("saluran langganan ditutup sebelum siklus penuh")
+			}
+			if j.ID != a.ID {
+				continue
+			}
+			switch j.Status {
+			case StatusRunning:
+				sawRunning = true
+			case StatusSuccess, StatusFailed, StatusCancelled:
+				sawTerminal = true
+			}
+		case <-deadline:
+			t.Fatalf("siklus tidak lengkap: running=%v terminal=%v", sawRunning, sawTerminal)
+		}
+	}
+}
+
+func TestJobJSONOmitsUnsetTimestamps(t *testing.T) {
+	queued, err := json.Marshal(Job{ID: "x", Kind: KindInstall, Status: StatusQueued})
+	if err != nil {
+		t.Fatalf("marshal job queued: %v", err)
+	}
+	if bytes.Contains(queued, []byte("startedAt")) || bytes.Contains(queued, []byte("endedAt")) {
+		t.Fatalf("job queued tidak boleh memuat timestamp: %s", queued)
+	}
+
+	started := time.Now()
+	ended := started.Add(time.Second)
+	done, err := json.Marshal(Job{ID: "x", Kind: KindInstall, Status: StatusSuccess, StartedAt: &started, EndedAt: &ended})
+	if err != nil {
+		t.Fatalf("marshal job selesai: %v", err)
+	}
+	if !bytes.Contains(done, []byte("startedAt")) || !bytes.Contains(done, []byte("endedAt")) {
+		t.Fatalf("job selesai harus memuat timestamp: %s", done)
 	}
 }

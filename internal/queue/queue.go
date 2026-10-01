@@ -33,21 +33,21 @@ const (
 
 // Job adalah satu pekerjaan di antrean.
 type Job struct {
-	ID             string    `json:"id"`
-	Kind           Kind      `json:"kind"`
-	Target         string    `json:"target"`
-	Label          string    `json:"label,omitempty"`
-	DestDir        string    `json:"destDir,omitempty"`
-	Replace        bool      `json:"replace,omitempty"`
-	AllowDowngrade bool      `json:"allowDowngrade,omitempty"`
-	Status         Status    `json:"status"`
-	Progress       int       `json:"progress"`
-	Message        string    `json:"message,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	Result         string    `json:"result,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	StartedAt      time.Time `json:"startedAt,omitempty"`
-	EndedAt        time.Time `json:"endedAt,omitempty"`
+	ID             string     `json:"id"`
+	Kind           Kind       `json:"kind"`
+	Target         string     `json:"target"`
+	Label          string     `json:"label,omitempty"`
+	DestDir        string     `json:"destDir,omitempty"`
+	Replace        bool       `json:"replace,omitempty"`
+	AllowDowngrade bool       `json:"allowDowngrade,omitempty"`
+	Status         Status     `json:"status"`
+	Progress       int        `json:"progress"`
+	Message        string     `json:"message,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	Result         string     `json:"result,omitempty"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	StartedAt      *time.Time `json:"startedAt,omitempty"`
+	EndedAt        *time.Time `json:"endedAt,omitempty"`
 }
 
 // Runner adalah kemampuan perangkat yang dibutuhkan antrean.
@@ -151,7 +151,8 @@ func (q *Queue) Cancel(id string) error {
 	case StatusQueued:
 		job.Status = StatusCancelled
 		job.Message = "dibatalkan sebelum dijalankan"
-		job.EndedAt = time.Now()
+		ended := time.Now()
+		job.EndedAt = &ended
 		snap := *job
 		q.mu.Unlock()
 		q.broadcast(snap)
@@ -249,7 +250,8 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 		return
 	}
 	job.Status = StatusRunning
-	job.StartedAt = time.Now()
+	started := time.Now()
+	job.StartedAt = &started
 	job.Message = "Mulai"
 	q.cancels[job.ID] = cancel
 	snap := *job
@@ -261,7 +263,8 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 
 	q.mu.Lock()
 	delete(q.cancels, job.ID)
-	job.EndedAt = time.Now()
+	ended := time.Now()
+	job.EndedAt = &ended
 	switch {
 	case job.Status == StatusCancelled:
 		// sudah ditandai oleh Cancel
