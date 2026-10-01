@@ -11,6 +11,7 @@
   <div class="device">
     <span id="dot" class="dot"></span>
     <span id="device-label">Memeriksa perangkat...</span>
+    <select id="device-select" class="hidden" aria-label="Pilih perangkat"></select>
   </div>
   <button id="refresh" class="secondary">Pindai ulang</button>
 </header>
@@ -46,7 +47,7 @@
 
     <table id="apk-table">
       <thead>
-        <tr><th></th><th>Berkas</th><th>Paket</th><th>Versi</th><th>Ukuran</th></tr>
+        <tr><th></th><th>Berkas</th><th>Paket</th><th>Versi</th><th>minSdk</th><th>Ukuran</th></tr>
       </thead>
       <tbody></tbody>
     </table>

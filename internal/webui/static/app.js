@@ -1,6 +1,20 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
+
+// escapeHtml mengubah karakter khusus HTML menjadi entitas. Semua nilai yang
+// berasal dari perangkat atau berkas pengguna (nama APK, nama paket, pesan
+// error, riwayat) harus melewatinya sebelum masuk ke innerHTML, supaya nama
+// berkas yang jahat tidak bisa menyuntikkan skrip (stored XSS).
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 const state = {
   apks: [],
   packages: [],
@@ -11,6 +25,7 @@ const state = {
   selectedPkgs: new Set(),
   jobs: new Map(),
   deviceReady: false,
+  selectedDevice: '',
 };
 
 function toast(message, isError) {
@@ -94,8 +109,34 @@ function renderDevice(status) {
     hint.classList.remove('hidden');
   }
   updateActionButtons();
+  renderDevicePicker(status);
   renderApks();
   renderPackages();
+}
+
+// renderDevicePicker menampilkan pemilih perangkat kecil saat lebih dari satu
+// perangkat tersambung (atau saat pengguna sudah memilih salah satunya).
+function renderDevicePicker(status) {
+  const sel = $('device-select');
+  const serials = [status.serial, ...(status.others || [])].filter(Boolean);
+  const show = (status.others && status.others.length > 0) || !!state.selectedDevice;
+  if (!show || serials.length === 0) {
+    sel.classList.add('hidden');
+    sel.innerHTML = '';
+    return;
+  }
+  if (state.selectedDevice && !serials.includes(state.selectedDevice)) {
+    state.selectedDevice = '';
+  }
+  sel.classList.remove('hidden');
+  sel.innerHTML = '';
+  serials.forEach((serial) => {
+    const opt = document.createElement('option');
+    opt.value = serial;
+    opt.textContent = serial;
+    if (serial === (state.selectedDevice || status.serial)) opt.selected = true;
+    sel.appendChild(opt);
+  });
 }
 
 function renderApks() {
@@ -106,9 +147,10 @@ function renderApks() {
     if (state.selectedApks.has(apk.path)) tr.classList.add('selected');
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedApks.has(apk.path) ? 'checked' : ''}></td>
-      <td>${apk.name}</td>
-      <td>${apk.package || '<span class="muted">tidak terbaca</span>'}</td>
-      <td>${apk.versionName || '-'}</td>
+      <td>${escapeHtml(apk.name)}</td>
+      <td>${apk.package ? escapeHtml(apk.package) : '<span class="muted">tidak terbaca</span>'}</td>
+      <td>${escapeHtml(apk.versionName || '-')}</td>
+      <td>${apk.minSdk || '-'}</td>
       <td>${humanSize(apk.size)}</td>`;
     if (apk.error) tr.title = apk.error;
     tr.querySelector('input').addEventListener('change', (e) => {
@@ -169,10 +211,10 @@ function renderPackages() {
     const detail = detailFor(pkg.name);
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedPkgs.has(pkg.name) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
-      <td>${pkg.name} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
-      <td>${pkg.versionCode || '-'}</td>
+      <td>${escapeHtml(pkg.name)} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
+      <td>${escapeHtml(pkg.versionCode || '-')}</td>
       <td>${detail ? humanSize(detail.sizeBytes) : '-'}</td>
-      <td>${detail?.installTime || '-'}</td>
+      <td>${escapeHtml(detail?.installTime || '-')}</td>
       <td class="row-actions">
         <button class="secondary" data-act="detail">Detail</button>
         <button class="danger" data-act="uninstall" ${locked || !ready ? 'disabled' : ''}>Copot</button>
@@ -215,14 +257,14 @@ async function showDetail(name) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ package: name }),
     });
-    el.innerHTML = `<h3>${info.package}</h3>
+    el.innerHTML = `<h3>${escapeHtml(info.package)}</h3>
       <dl>
-        <dt>Versi</dt><dd>${info.versionName || '-'} (kode ${info.versionCode || '-'})</dd>
+        <dt>Versi</dt><dd>${escapeHtml(info.versionName || '-')} (kode ${escapeHtml(info.versionCode || '-')})</dd>
         <dt>Ukuran data</dt><dd>${humanSize(info.sizeBytes)}</dd>
-        <dt>Terpasang</dt><dd>${info.installTime || '-'}</dd>
-        <dt>Diperbarui</dt><dd>${info.updateTime || '-'}</dd>
-        <dt>APK</dt><dd>${info.apkPath || '-'}</dd>
-        <dt>Izin</dt><dd>${(info.permissions || []).join('<br>') || '-'}</dd>
+        <dt>Terpasang</dt><dd>${escapeHtml(info.installTime || '-')}</dd>
+        <dt>Diperbarui</dt><dd>${escapeHtml(info.updateTime || '-')}</dd>
+        <dt>APK</dt><dd>${escapeHtml(info.apkPath || '-')}</dd>
+        <dt>Izin</dt><dd>${(info.permissions || []).map(escapeHtml).join('<br>') || '-'}</dd>
       </dl>`;
   } catch (err) {
     el.textContent = 'Gagal memuat detail: ' + err.message;
@@ -277,10 +319,10 @@ function renderJobs() {
     const li = document.createElement('li');
     const running = job.status === 'running' || job.status === 'queued';
     li.innerHTML = `
-      <div><strong>${job.label || job.target}</strong>
-        <span class="status-${job.status}">${job.status}</span></div>
-      <div class="meta">${job.message || ''} ${job.error ? '· ' + job.error : ''} ${job.result ? '· ' + job.result : ''}</div>
-      <div class="progress"><span style="width:${job.status === 'success' ? 100 : job.progress || 0}%"></span></div>
+      <div><strong>${escapeHtml(job.label || job.target)}</strong>
+        <span class="status-${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>
+      <div class="meta">${escapeHtml(job.message || '')} ${job.error ? '· ' + escapeHtml(job.error) : ''} ${job.result ? '· ' + escapeHtml(job.result) : ''}</div>
+      <div class="progress"><span style="width:${job.status === 'success' ? 100 : (Number(job.progress) || 0)}%"></span></div>
       ${running ? '<button class="secondary" data-cancel>Batalkan</button>' : ''}`;
     if (running) {
       li.querySelector('[data-cancel]').addEventListener('click', () => {
@@ -335,10 +377,10 @@ function renderHistory() {
       .some((f) => (f || '').toLowerCase().includes(term)))
     .forEach((e) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${new Date(e.time).toLocaleString('id-ID')}</td>
-        <td>${e.action}</td><td>${e.package || '-'}</td>
+      tr.innerHTML = `<td>${escapeHtml(new Date(e.time).toLocaleString('id-ID'))}</td>
+        <td>${escapeHtml(e.action)}</td><td>${escapeHtml(e.package || '-')}</td>
         <td class="${e.success ? 'status-success' : 'status-failed'}">${e.success ? 'sukses' : 'gagal'}</td>
-        <td>${e.detail || ''}</td>`;
+        <td>${escapeHtml(e.detail || '')}</td>`;
       tbody.appendChild(tr);
     });
 }
@@ -432,6 +474,21 @@ function setupBottomToggle() {
 function bind() {
   $('refresh').addEventListener('click', () =>
     api('/api/device/refresh', { method: 'POST' }).catch((e) => toast(e.message, true)));
+  $('device-select').addEventListener('change', async (e) => {
+    state.selectedDevice = e.target.value;
+    try {
+      const st = await api('/api/device/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serial: state.selectedDevice }),
+      });
+      renderDevice(st);
+      loadPackages();
+    } catch (err) {
+      toast(err.message, true);
+      state.selectedDevice = '';
+    }
+  });
   $('load-folder').addEventListener('click', async () => {
     const folder = $('folder').value.trim();
     if (!folder) { toast('Isi dulu folder koleksi', true); return; }
