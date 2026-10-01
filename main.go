@@ -112,7 +112,17 @@ func run(port int, noOpen bool, dataDir string) error {
 		}
 	}
 
-	server := &http.Server{Handler: api.Handler()}
+	// ReadHeaderTimeout melindungi server lokal dari koneksi yang menggantung
+	// saat mengirim header. WriteTimeout sengaja 0 (tanpa batas): endpoint
+	// GET /api/events adalah aliran SSE yang hidup selama halaman terbuka, dan
+	// WriteTimeout akan memutus aliran itu di tengah jalan. Karena server hanya
+	// mendengarkan 127.0.0.1 dan tidak menerima badan besar, tanpa batas tulis
+	// di sini aman.
+	server := &http.Server{
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      0,
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
