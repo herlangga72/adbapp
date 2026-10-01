@@ -1,16 +1,21 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/herlangga72/adbapp/internal/adbx"
 	"github.com/herlangga72/adbapp/internal/device"
@@ -24,7 +29,11 @@ type fakeDevice struct{ status device.Status }
 func (f fakeDevice) Current() device.Status            { return f.status }
 func (f fakeDevice) Refresh(ctx context.Context) error { return nil }
 
-type fakeQueue struct{ enqueued []queue.Job }
+type fakeQueue struct {
+	enqueued     []queue.Job
+	unsubOnce    sync.Once
+	unsubscribed chan struct{}
+}
 
 func (f *fakeQueue) Enqueue(j queue.Job) queue.Job {
 	f.enqueued = append(f.enqueued, j)
@@ -36,12 +45,24 @@ func (f *fakeQueue) Jobs() []queue.Job      { return nil }
 func (f *fakeQueue) Cancel(id string) error { return nil }
 func (f *fakeQueue) Subscribe() (<-chan queue.Job, func()) {
 	ch := make(chan queue.Job)
-	return ch, func() { close(ch) }
+	if f.unsubscribed == nil {
+		f.unsubscribed = make(chan struct{})
+	}
+	return ch, func() {
+		close(ch)
+		f.unsubOnce.Do(func() { close(f.unsubscribed) })
+	}
 }
 
-type fakeHistory struct{ entries []store.Entry }
+type fakeHistory struct {
+	entries   []store.Entry
+	lastLimit int
+}
 
-func (f *fakeHistory) Read(limit int) ([]store.Entry, error) { return f.entries, nil }
+func (f *fakeHistory) Read(limit int) ([]store.Entry, error) {
+	f.lastLimit = limit
+	return f.entries, nil
+}
 func (f *fakeHistory) ExportCSV(w io.Writer) error {
 	_, err := io.WriteString(w, "time,action,package,device,success,detail\n")
 	return err
@@ -104,6 +125,7 @@ func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 	payload := `{"kind":"uninstall","targets":["com.a","com.b"]}`
 	rec := httptest.NewRecorder()
 	req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
@@ -114,12 +136,30 @@ func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 	if fq.enqueued[0].Kind != queue.KindUninstall || fq.enqueued[1].Target != "com.b" {
 		t.Fatalf("job salah: %+v", fq.enqueued)
 	}
+	if fq.enqueued[0].DestDir != s.Paths.PulledDir {
+		t.Fatalf("DestDir salah: %q", fq.enqueued[0].DestDir)
+	}
+	if fq.enqueued[0].Label == "" {
+		t.Fatalf("Label kosong: %+v", fq.enqueued[0])
+	}
+}
+
+func TestCreateJobsCancelKnownID(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/jobs/cancel", strings.NewReader(`{"id":"job-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("harus 200, dapat %d body %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestCreateJobsRejectsUnknownKind(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
 	req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"ngawur","targets":["x"]}`))
+	req.Header.Set("Content-Type", "application/json")
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("harus 400, dapat %d", rec.Code)
@@ -196,5 +236,240 @@ func TestIndexServedFromEmbeddedFS(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "adbapp") {
 		t.Fatalf("halaman tidak disajikan: %s", rec.Body.String())
+	}
+}
+
+func TestEventsStreamsStateThenReturnsOnCancel(t *testing.T) {
+	s, fq := newTestServer(t)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("kode %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content type salah: %q", ct)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var frame strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("baca frame gagal: %v", err)
+		}
+		if line == "\n" {
+			break
+		}
+		frame.WriteString(line)
+	}
+	if !strings.Contains(frame.String(), "event: state") {
+		t.Fatalf("frame pertama bukan state: %q", frame.String())
+	}
+
+	cancel()
+	select {
+	case <-fq.unsubscribed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler SSE tidak berhenti setelah konteks dibatalkan (bocor)")
+	}
+}
+
+func TestCrossSiteGuard(t *testing.T) {
+	const body = `{"kind":"uninstall","targets":["com.a"]}`
+	cases := []struct {
+		name     string
+		origin   string
+		secFetch string
+		ct       string
+		want     int
+	}{
+		{"origin lintas situs", "http://evil.example.com", "", "application/json", http.StatusForbidden},
+		{"sec-fetch cross-site", "", "cross-site", "application/json", http.StatusForbidden},
+		{"content type text/plain", "", "", "text/plain", http.StatusUnsupportedMediaType},
+		{"origin lokal dan json", "http://127.0.0.1:8765", "same-origin", "application/json", http.StatusOK},
+		{"localhost dan json", "http://localhost", "", "application/json", http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestServer(t)
+			rec := httptest.NewRecorder()
+			req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(body))
+			req.Header.Set("Content-Type", tc.ct)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.secFetch != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.secFetch)
+			}
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("kode %d, mau %d (body %s)", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestFromURLRejectsGarbageAndLeavesNoFile(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "bukan apk")
+	}))
+	defer upstream.Close()
+
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"url":%q,"name":"gagal.apk"}`, upstream.URL)
+	req := localRequest(http.MethodPost, "/api/apks/url", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d body %s", rec.Code, rec.Body.String())
+	}
+	entries, err := os.ReadDir(s.Paths.UploadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("ada berkas tersisa: %v", entries)
+	}
+}
+
+func TestFromURLHostileNameStaysInsideUploads(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "bukan apk")
+	}))
+	defer upstream.Close()
+
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"url":%q,"name":"../../etc/passwd"}`, upstream.URL)
+	req := localRequest(http.MethodPost, "/api/apks/url", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+
+	// Bagian pembuktian containment: setiap berkas harus berada di UploadsDir.
+	root := filepath.Dir(filepath.Dir(filepath.Dir(s.Paths.UploadsDir)))
+	if _, err := os.Stat(filepath.Join(root, "etc", "passwd")); err == nil {
+		t.Fatalf("berkas menulis keluar dari UploadsDir")
+	}
+	entries, err := os.ReadDir(s.Paths.UploadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("ada berkas tersisa: %v", entries)
+	}
+}
+
+func TestFromURLDoesNotDestroyExistingAPK(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(s.Paths.UploadsDir, "sama.apk")
+	original := []byte("APK-LAMA-YANG-BERHARGA")
+	if err := os.WriteFile(dest, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "bukan apk")
+	}))
+	defer upstream.Close()
+
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"url":%q,"name":"sama.apk"}`, upstream.URL)
+	req := localRequest(http.MethodPost, "/api/apks/url", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d body %s", rec.Code, rec.Body.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("berkas lama hilang: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("berkas lama berubah: %q", got)
+	}
+	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
+		t.Fatalf("sisa berkas .part tidak dibersihkan: %v", err)
+	}
+}
+
+func TestUploadRejectsNonAPK(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	writeMultipart(t, &body, "file", "catatan.txt", []byte("bukan apk"))
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/apks/upload", &body)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=batas")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHistoryHonoursLimit(t *testing.T) {
+	s, _ := newTestServer(t)
+	fh := s.History.(*fakeHistory)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/history?limit=2", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d", rec.Code)
+	}
+	if fh.lastLimit != 2 {
+		t.Fatalf("limit tidak diteruskan: %d", fh.lastLimit)
+	}
+}
+
+func TestConfigRoundTripsThroughSaveHook(t *testing.T) {
+	s, _ := newTestServer(t)
+	var saved store.Config
+	s.SaveCfg = func(c store.Config) error {
+		saved = c
+		return nil
+	}
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/config", strings.NewReader(`{"apkFolder":"/koleksi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	}
+	if saved.ApkFolder != "/koleksi" {
+		t.Fatalf("config tidak tersimpan: %+v", saved)
+	}
+}
+
+func TestMissingContentTypeRejectedOnJSONEndpoint(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"uninstall","targets":["com.a"]}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("harus 415, dapat %d body %s", rec.Code, rec.Body.String())
 	}
 }

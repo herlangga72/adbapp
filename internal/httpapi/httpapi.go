@@ -4,10 +4,14 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -73,22 +77,53 @@ func (s *Server) Handler() http.Handler {
 	return localOnly(mux)
 }
 
-// localOnly menolak permintaan yang datang dengan Host bukan alamat lokal,
-// supaya server yang hanya mendengarkan 127.0.0.1 tidak bisa dipakai halaman
-// web lain di jaringan.
+// loopbackHost mengembalikan true bila host (tanpa skema, boleh dengan port)
+// menunjuk ke komputer ini. Dipakai untuk memeriksa Host maupun Origin.
+func loopbackHost(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	host = strings.TrimSuffix(host, ".")
+	return strings.EqualFold(host, "127.0.0.1") ||
+		strings.EqualFold(host, "localhost") ||
+		strings.EqualFold(host, "::1")
+}
+
+// loopbackOrigin memeriksa header Origin: harus skema http dan host lokal.
+func loopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	return loopbackHost(u.Host)
+}
+
+// localOnly menjaga server yang hanya mendengarkan 127.0.0.1 supaya tidak bisa
+// dipakai halaman web lain. Selain memeriksa Host, ia menolak permintaan lintas
+// situs dari peramban lewat header Origin dan Sec-Fetch-Site.
 func localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if i := strings.LastIndex(host, ":"); i >= 0 {
-			host = host[:i]
-		}
-		host = strings.Trim(host, "[]")
-		switch host {
-		case "127.0.0.1", "localhost", "::1":
-			next.ServeHTTP(w, r)
-		default:
+		if !loopbackHost(r.Host) {
 			http.Error(w, "hanya bisa diakses dari komputer ini", http.StatusForbidden)
+			return
 		}
+		if origin := r.Header.Get("Origin"); origin != "" && !loopbackOrigin(origin) {
+			http.Error(w, "permintaan lintas situs ditolak", http.StatusForbidden)
+			return
+		}
+		switch strings.ToLower(r.Header.Get("Sec-Fetch-Site")) {
+		case "", "same-origin", "none":
+			// permintaan tanpa header ini (curl, skrip) tetap dilayani.
+		default:
+			http.Error(w, "permintaan lintas situs ditolak", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -102,10 +137,42 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
+// errUnsupportedMediaType dipakai saat badan permintaan bukan application/json.
+var errUnsupportedMediaType = errors.New("badan permintaan harus application/json")
+
+// isJSONContentType memeriksa header Content-Type. Header wajib ada dan harus
+// application/json; akhiran parameter seperti "; charset=utf-8" diterima.
+// Ini menutup celah CSRF lewat content type yang boleh dikirim lintas situs
+// tanpa preflight (text/plain, application/x-www-form-urlencoded).
+func isJSONContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, "application/json")
+}
+
+// decodeJSON membaca badan JSON. Bila Content-Type bukan application/json ia
+// mengembalikan errUnsupportedMediaType supaya pemanggil membalas 415.
 func decodeJSON(r *http.Request, v any) error {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		return errUnsupportedMediaType
+	}
 	defer r.Body.Close()
 	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<20))
 	return dec.Decode(v)
+}
+
+// writeDecodeError memetakan kegagalan decodeJSON ke kode status yang tepat.
+func writeDecodeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errUnsupportedMediaType) {
+		writeError(w, http.StatusUnsupportedMediaType, err)
+		return
+	}
+	writeError(w, http.StatusBadRequest, fmt.Errorf("badan permintaan tidak sah: %w", err))
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -144,7 +211,11 @@ func (s *Server) handlePackageDetail(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Package string `json:"package"`
 	}
-	if err := decodeJSON(r, &req); err != nil || req.Package == "" {
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if req.Package == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("package wajib diisi"))
 		return
 	}
@@ -166,7 +237,7 @@ type createJobsRequest struct {
 func (s *Server) handleCreateJobs(w http.ResponseWriter, r *http.Request) {
 	var req createJobsRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("badan permintaan tidak sah: %w", err))
+		writeDecodeError(w, err)
 		return
 	}
 	if !knownKind(req.Kind) {
@@ -228,7 +299,11 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := decodeJSON(r, &req); err != nil || req.ID == "" {
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if req.ID == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("id wajib diisi"))
 		return
 	}
@@ -274,7 +349,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	var cfg store.Config
 	if err := decodeJSON(r, &cfg); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeDecodeError(w, err)
 		return
 	}
 	if s.SaveCfg != nil {

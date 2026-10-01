@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,9 +10,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/herlangga72/adbapp/internal/apkmeta"
 )
+
+// maxAPKSize adalah batas atas ukuran berkas APK yang diterima (2 GiB).
+const maxAPKSize = 2 << 30
 
 type apkEntry struct {
 	Path        string `json:"path"`
@@ -76,7 +81,13 @@ func (s *Server) handleListAPKs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAPKSize)
 	if err := r.ParseMultipartForm(1 << 30); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("berkas terlalu besar"))
+			return
+		}
 		writeError(w, http.StatusBadRequest, fmt.Errorf("gagal membaca berkas: %w", err))
 		return
 	}
@@ -122,28 +133,26 @@ func (s *Server) handleFromURL(w http.ResponseWriter, r *http.Request) {
 		URL  string `json:"url"`
 		Name string `json:"name"`
 	}
-	if err := decodeJSON(r, &req); err != nil || req.URL == "" {
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if req.URL == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("url wajib diisi"))
 		return
 	}
 
 	name := filepath.Base(req.Name)
-	if name == "" || name == "." || name == "/" {
+	if name == "" || name == "." || name == string(filepath.Separator) {
 		name = filepath.Base(req.URL)
+	}
+	name = filepath.Base(name)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("nama berkas tidak sah"))
+		return
 	}
 	if !strings.EqualFold(filepath.Ext(name), ".apk") {
 		name += ".apk"
-	}
-
-	resp, err := http.Get(req.URL)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, fmt.Errorf("gagal mengunduh: %w", err))
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		writeError(w, http.StatusBadGateway, fmt.Errorf("unduhan gagal, kode %d", resp.StatusCode))
-		return
 	}
 
 	if err := os.MkdirAll(s.Paths.UploadsDir, 0o755); err != nil {
@@ -151,26 +160,71 @@ func (s *Server) handleFromURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dest := filepath.Join(s.Paths.UploadsDir, name)
-	out, err := os.Create(dest)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if _, err := io.Copy(out, io.LimitReader(resp.Body, 2<<30)); err != nil {
-		out.Close()
-		writeError(w, http.StatusBadGateway, fmt.Errorf("gagal menyimpan unduhan: %w", err))
-		return
-	}
-	out.Close()
+	part := dest + ".part"
+	// Bersihkan sisa unduhan sebelumnya agar tidak menumpuk.
+	_ = os.Remove(part)
 
-	entry := s.entryFor(dest)
+	if err := s.downloadAPK(r.Context(), req.URL, part); err != nil {
+		_ = os.Remove(part)
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	entry := s.entryFor(part)
 	if entry.Error != "" {
-		if err := os.Remove(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+		_ = os.Remove(part)
 		writeError(w, http.StatusBadRequest, fmt.Errorf("unduhan bukan APK yang sah: %s", entry.Error))
 		return
 	}
-	writeJSON(w, http.StatusOK, entry)
+	// Baru setelah tervalidasi, ganti berkas tujuan supaya APK lama dengan nama
+	// sama tidak rusak ketika unduhan gagal.
+	if err := os.Rename(part, dest); err != nil {
+		_ = os.Remove(part)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.entryFor(dest))
+}
+
+// downloadAPK mengunduh url ke path dengan batas waktu, batas ukuran, dan
+// pembatasan pengalihan. Badan yang melebihi maxAPKSize ditolak, bukan dipotong.
+func (s *Server) downloadAPK(ctx context.Context, url, path string) error {
+	client := &http.Client{
+		Timeout: 15 * time.Minute,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("terlalu banyak pengalihan")
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("gagal mengunduh: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("gagal mengunduh: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unduhan gagal, kode %d", resp.StatusCode)
+	}
+
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(out, io.LimitReader(resp.Body, maxAPKSize+1))
+	if err != nil {
+		out.Close()
+		return fmt.Errorf("gagal menyimpan unduhan: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if n > maxAPKSize {
+		return fmt.Errorf("unduhan terlalu besar")
+	}
+	return nil
 }
