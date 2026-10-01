@@ -5256,8 +5256,8 @@ import (
 
 type fakeDevice struct{ status device.Status }
 
-func (f fakeDevice) Current() device.Status                     { return f.status }
-func (f fakeDevice) Refresh(ctx context.Context) error          { return nil }
+func (f fakeDevice) Current() device.Status            { return f.status }
+func (f fakeDevice) Refresh(ctx context.Context) error { return nil }
 
 type fakeQueue struct{ enqueued []queue.Job }
 
@@ -5267,7 +5267,7 @@ func (f *fakeQueue) Enqueue(j queue.Job) queue.Job {
 	j.Status = queue.StatusQueued
 	return j
 }
-func (f *fakeQueue) Jobs() []queue.Job { return nil }
+func (f *fakeQueue) Jobs() []queue.Job      { return nil }
 func (f *fakeQueue) Cancel(id string) error { return nil }
 func (f *fakeQueue) Subscribe() (<-chan queue.Job, func()) {
 	ch := make(chan queue.Job)
@@ -5308,10 +5308,18 @@ func newTestServer(t *testing.T) (*Server, *fakeQueue) {
 	return s, fq
 }
 
+// localRequest membuat permintaan dengan Host lokal, karena httptest.NewRequest
+// memakai "example.com" yang memang ditolak oleh middleware localOnly.
+func localRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Host = "127.0.0.1"
+	return req
+}
+
 func TestStateEndpoint(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/state", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d", rec.Code)
 	}
@@ -5330,7 +5338,7 @@ func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 	s, fq := newTestServer(t)
 	payload := `{"kind":"uninstall","targets":["com.a","com.b"]}`
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/jobs", strings.NewReader(payload))
+	req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(payload))
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
@@ -5346,7 +5354,7 @@ func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 func TestCreateJobsRejectsUnknownKind(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"ngawur","targets":["x"]}`))
+	req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"ngawur","targets":["x"]}`))
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("harus 400, dapat %d", rec.Code)
@@ -5356,7 +5364,7 @@ func TestCreateJobsRejectsUnknownKind(t *testing.T) {
 func TestExportCSVSetsHeaders(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/history/export?format=csv", nil))
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/history/export?format=csv", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d", rec.Code)
 	}
@@ -5388,7 +5396,7 @@ func TestUploadSavesFile(t *testing.T) {
 	var body bytes.Buffer
 	writeMultipart(t, &body, "file", "contoh.apk", []byte("bukan-apk-sungguhan"))
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/apks/upload", &body)
+	req := localRequest(http.MethodPost, "/api/apks/upload", &body)
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=batas")
 	s.Handler().ServeHTTP(rec, req)
 
@@ -5417,7 +5425,7 @@ func writeMultipart(t *testing.T, buf *bytes.Buffer, field, filename string, con
 func TestIndexServedFromEmbeddedFS(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d", rec.Code)
 	}
@@ -5482,14 +5490,14 @@ type Adb interface {
 }
 
 type Server struct {
-	Device   DeviceSource
-	Queue    JobQueue
-	History  History
-	Adb      Adb
-	Paths    paths.Paths
-	Static   fs.FS
-	LoadCfg  func() (store.Config, error)
-	SaveCfg  func(store.Config) error
+	Device  DeviceSource
+	Queue   JobQueue
+	History History
+	Adb     Adb
+	Paths   paths.Paths
+	Static  fs.FS
+	LoadCfg func() (store.Config, error)
+	SaveCfg func(store.Config) error
 }
 
 // Handler merakit seluruh rute.
@@ -5959,7 +5967,7 @@ func (s *Server) handleFromURL(w http.ResponseWriter, r *http.Request) {
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/httpapi/ -v`
-Expected: PASS untuk kedelapan tes.
+Expected: PASS untuk ketujuh tes.
 
 - [ ] **Step 6: Commit**
 
