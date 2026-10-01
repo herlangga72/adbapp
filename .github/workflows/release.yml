@@ -1,0 +1,105 @@
+name: build-and-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            platform_tools: linux
+            archive: tar.gz
+          - runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            platform_tools: win
+            archive: zip
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            platform_tools: darwin
+            archive: tar.gz
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+            platform_tools: darwin
+            archive: tar.gz
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Siapkan biner adb untuk platform ini
+        shell: bash
+        run: |
+          set -euo pipefail
+          PT_VERSION=35.0.2
+          PT_OS="${{ matrix.platform_tools }}"
+          # adb.exe di Windows memuat AdbWinApi.dll secara statis, jadi DLL itu
+          # harus ikut diekstrak berdampingan dengan adb.exe.
+          FILES=(adb)
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            FILES=(adb.exe AdbWinApi.dll AdbWinUsbApi.dll)
+          fi
+          DEST="internal/bundle/bin/${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$DEST"
+          curl -fsSL -o pt.zip \
+            "https://dl.google.com/android/repository/platform-tools_r${PT_VERSION}-${PT_OS}.zip"
+          unzip -q -o pt.zip
+          for f in "${FILES[@]}"; do cp "platform-tools/$f" "$DEST/$f"; done
+          chmod +x "$DEST/adb" 2>/dev/null || true
+          chmod +x "$DEST/adb.exe" 2>/dev/null || true
+          ls -l "$DEST"
+
+      - name: Jalankan pengujian
+        shell: bash
+        run: go test ./...
+
+      - name: Bangun biner
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          NAME=adbapp
+          if [ "$GOOS" = "windows" ]; then NAME=adbapp.exe; fi
+          go build -trimpath -ldflags "-s -w" -o "dist/$GOOS-$GOARCH/$NAME" .
+          ls -l "dist/$GOOS-$GOARCH"
+
+      - name: Bungkus arsip
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "dist/${{ matrix.goos }}-${{ matrix.goarch }}"
+          BASE="adbapp-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (command -v zip >/dev/null && zip -q "../$BASE.zip" *) || powershell -Command "Compress-Archive -Path * -DestinationPath ../$BASE.zip -Force"
+          else
+            tar czf "../$BASE.tar.gz" *
+          fi
+          ls -l ..
+
+      - name: Unggah ke halaman rilis
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
