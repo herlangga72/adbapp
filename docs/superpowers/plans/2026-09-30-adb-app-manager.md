@@ -6988,15 +6988,26 @@ Run: `head -1 go.mod` dan `grep -c "herlangga72/adbapp" README.md`
 Expected: `module github.com/herlangga72/adbapp`, dan README memuat 2 tautan
 `github.com/herlangga72/adbapp`.
 
-- [ ] **Step 2: Gabungkan ke branch utama, buat repo, lalu push**
+- [ ] **Step 2: Repo GitHub dan kebijakan push berkelanjutan**
+
+Repo sudah dibuat (2026-10-01): `https://github.com/herlangga72/adbapp`, publik,
+branch default `master`, remote `origin` menunjuk ke
+`git@github.com:herlangga72/adbapp.git`. Sejak itu, **setiap langkah kerja
+di-push** supaya progres selalu terlihat di GitHub:
+
+```bash
+git push origin feat/adbapp     # setelah setiap task selesai
+```
+
+Di akhir seluruh task, gabungkan ke branch utama:
 
 ```bash
 git checkout master
 git merge --no-ff feat/adbapp -m "feat: adbapp v1.0.0 (pasang dan copot aplikasi Android lewat adb)"
-gh repo create herlangga72/adbapp --public --source=. --remote=origin --push
+git push origin master
 ```
 
-Expected: repo dibuat, branch `master` ter-push, dan `origin` menunjuk ke
+Expected: `master` memuat seluruh riwayat, dan `origin` tetap menunjuk ke
 `git@github.com:herlangga72/adbapp.git`.
 
 - [ ] **Step 3: Jalankan build sekali tanpa tag untuk memastikan matriksnya hijau**
