@@ -117,7 +117,10 @@ dikirim balik ke browser lewat SSE tanpa perlu refresh.
    terputus"; sisa antrean berhenti di `queued`, bukan ditandai sukses.
 
 Karena pemakaiannya satu HP bergantian, sistem memakai satu device aktif. Bila
-lebih dari satu perangkat tersambung, UI menampilkan pemilih kecil.
+lebih dari satu perangkat tersambung, UI menampilkan pemilih kecil di bar atas
+untuk memilih perangkat mana yang aktif (endpoint `POST /api/device/select`);
+pin dilepas otomatis bila perangkat itu tercabut. Setiap aksi dicatat, termasuk
+pembatalan job yang masih `queued` (`Cancel` memanggil callback riwayat).
 
 ## 6. Antarmuka pengguna
 
@@ -127,7 +130,9 @@ dilipat.
 **Bar atas (selalu terlihat)** — indikator perangkat: titik warna (hijau siap,
 kuning belum diizinkan, merah tidak ada), merek/model, versi Android, tombol
 "Pindai ulang". Bila perangkat belum diizinkan, instruksi singkat muncul di
-sini.
+sini. Versi Android dibaca dari `getprop ro.build.version.release` ketika
+perangkat menjadi siap, lalu di-cache per serial agar tidak ditanyakan ulang
+tiap siklus pemantauan; bila pembacaan gagal, bagian versi dibiarkan kosong.
 
 **Tab "Pasang"** — kotak seret & lepas besar, dua tombol (Folder koleksi,
 Tambah dari URL), daftar APK yang masuk dengan kotak centang, nama berkas,
@@ -136,7 +141,9 @@ package, versi, ukuran, dan tombol "Pasang terpilih (N)".
 **Tab "Terpasang"** — kotak pencarian, filter (Semua / Pihak ketiga / Sistem),
 dan pengurutan (nama, ukuran, tanggal). Tiap baris punya aksi cepat: Copot,
 Copot (simpan data), Hapus data, Tarik APK. Aplikasi sistem ditandai dan tombol
-copotnya nonaktif.
+copotnya nonaktif. Ukuran dan tanggal hanya tersedia lewat pemuatan detail per
+paket (tombol "Muat detail"), jadi pengurutan ukuran/tanggal baru aktif setelah
+detail dimuat; sebelum itu urutan jatuh kembali ke nama.
 
 **Panel bawah "Antrean & Riwayat"** — dua sub-tab: antrean job berjalan dengan
 progress bar dan tombol batalkan, serta riwayat audit dengan filter dan tombol
@@ -155,6 +162,8 @@ singkat berbahasa manusia beserta langkah perbaikannya.
 - Perangkat tidak tersambung → status merah, tombol dinonaktifkan, petunjuk:
   cek kabel, pilih mode *File Transfer*, pastikan USB debugging menyala.
 - Belum diizinkan (*unauthorized*) → instruksi menekan *Allow* di layar HP.
+- Versi Android dibaca dari `getprop`; kegagalan pembacaan tidak muncul sebagai
+  error, bagian versi hanya dikosongkan (pemantauan tetap berjalan).
 - Perangkat tercabut saat job jalan → job ditandai gagal dengan pesan
   "perangkat terputus"; sisa antrean berhenti di `queued`.
 
@@ -185,13 +194,17 @@ Folder data aplikasi mengikuti konvensi tiap OS (Windows:
 `%LOCALAPPDATA%\adbapp`; Linux: `$XDG_DATA_HOME/adbapp` atau
 `~/.local/share/adbapp`; macOS: `~/Library/Application Support/adbapp`).
 
+Server hanya mengikat `127.0.0.1`; binding loopback itu dipasangkan dengan guard
+origin peramban (`Origin`/`Sec-Fetch-Site` loopback dan `Content-Type`
+`application/json` pada endpoint JSON). Ini pengerasan desain "tanpa login",
+bukan perubahan pengalaman pengguna.
+
 **Windows** — unduh `.zip`, ekstrak, klik dua kali `adbapp.exe`.
 **Linux** — unduh `.tar.gz`, ekstrak, jalankan `./adbapp`.
-**macOS** — installer satu baris lewat Terminal (ganti `<user>` dengan pemilik
-repo rilis):
+**macOS** — installer satu baris lewat Terminal:
 
 ```
-curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
+curl -fsSL https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
 ```
 
 Berkas yang diambil `curl` tidak diberi label quarantine, sehingga Gatekeeper
@@ -213,7 +226,10 @@ proses). Dengan itu:
 - `queue` diuji urutan, pembatalan, dan perilaku saat satu job gagal.
 - `store` diuji penulisan riwayat dan ekspor.
 - `httpapi` diuji lewat `httptest`, termasuk aliran event SSE.
-- `apkmeta` diuji dengan berkas APK contoh kecil yang disimpan di repo.
+- `apkmeta` diuji dengan APK kecil. Fixture tidak disimpan di repo: tes
+  membangunnya saat berjalan dari `AndroidManifest.xml` biner bawaan modul
+  `apkparser`. Berkas `testdata/mini.apk` hanya diperiksa bila ada, dan
+  di-skip bila tidak.
 
 **Dengan perangkat sungguhan (checklist rilis).** Pasang satu APK contoh,
 pastikan muncul di daftar terpasang, tarik APK-nya, lalu copot. Termasuk uji
@@ -224,9 +240,10 @@ mencabut kabel di tengah instalasi.
 Workflow GitHub Actions berjalan pada matriks Windows, Linux, macOS. Pada tag
 `v*`:
 
-1. Unduh platform-tools untuk OS tersebut, lalu tanam `adb` ke dalam biner
-   (tiap OS memakai berkas `adb` sendiri, ditanam lewat mekanisme khusus Go
-   dengan build tag per OS).
+1. Unduh platform-tools untuk OS tersebut, lalu tanam `adb` ke dalam biner.
+   Semua biner platform disimpan di bawah `internal/bundle/bin/<os>-<arch>/`
+   dan ditanam lewat `go:embed`; direktori platform yang sesuai dipilih saat
+   runtime, bukan lewat build tag per OS.
 2. Jalankan seluruh pengujian.
 3. Hasilkan paket `.zip` (Windows) dan `.tar.gz` (Linux/macOS).
 4. Unggah otomatis ke halaman Releases.

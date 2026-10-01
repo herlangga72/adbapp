@@ -12,7 +12,7 @@
 
 **Catatan penyimpangan kecil dari spec:** spec menyebut "adb palsu berupa skrip kecil". Di plan ini penggantinya adalah `Execer` yang bisa disuntik (fake di dalam proses), karena skrip shell tidak jalan di runner Windows saat pengujian CI. Fungsinya sama: seluruh perilaku `adb` bisa disimulasikan.
 
-**Catatan konvensi:** module path dipakai `github.com/herlangga72/adbapp`. Ganti bila nama repo GitHub berbeda, dengan `go mod edit -module github.com/<user>/adbapp` diikuti `go mod tidy`.
+**Catatan konvensi:** module path dipakai `github.com/herlangga72/adbapp`. Ganti bila nama repo GitHub berbeda, dengan `go mod edit -module github.com/herlangga72/adbapp` diikuti `go mod tidy`.
 
 ---
 
@@ -55,9 +55,11 @@
 cd /home/server/autoinstall-and-uninstall-using-adb
 go mod init github.com/herlangga72/adbapp
 go get github.com/avast/apkparser@latest
+go mod edit -go=1.24
 ```
 
-Expected: `go.mod` terbentuk dan `apkparser` tercatat di `require`.
+Expected: `go.mod` terbentuk, `apkparser` tercatat di `require`, dan direktif `go`
+di pin ke `1.24` (bukan versi toolchain lokal).
 
 - [ ] **Step 2: Tulis `.gitignore`**
 
@@ -108,6 +110,9 @@ git commit -m "chore: kerangka modul Go untuk adbapp"
 **Files:**
 - Create: `internal/paths/paths.go`
 - Test: `internal/paths/paths_test.go`
+- Test: `internal/paths/base_linux_test.go` (`//go:build linux`)
+- Test: `internal/paths/base_windows_test.go` (`//go:build windows`)
+- Test: `internal/paths/base_darwin_test.go` (`//go:build darwin`)
 
 - [ ] **Step 1: Tulis tes yang gagal**
 
@@ -117,8 +122,8 @@ Create `internal/paths/paths_test.go`:
 package paths
 
 import (
+	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -149,10 +154,32 @@ func TestEnsureCreatesDirs(t *testing.T) {
 	}
 }
 
-func TestBaseDirUsesXDGOnLinux(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("khusus Linux")
+func TestResolveUsesAdbappDirectory(t *testing.T) {
+	p, err := Resolve()
+	if err != nil {
+		t.Skipf("Resolve error: %v", err)
 	}
+	if got := filepath.Base(p.DataDir); got != "adbapp" {
+		t.Fatalf("got %q, want adbapp", got)
+	}
+}
+
+func isDir(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
+}
+```
+
+Create `internal/paths/base_linux_test.go` (`//go:build linux`):
+
+```go
+//go:build linux
+
+package paths
+
+import "testing"
+
+func TestBaseDirUsesXDGOnLinux(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "/xdg")
 	got, err := baseDir()
 	if err != nil {
@@ -160,6 +187,74 @@ func TestBaseDirUsesXDGOnLinux(t *testing.T) {
 	}
 	if got != "/xdg" {
 		t.Fatalf("got %q, want /xdg", got)
+	}
+}
+
+func TestBaseDirIgnoresRelativeXDG(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "relative/data")
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	if got == "relative/data" {
+		t.Fatalf("baseDir memakai XDG relatif: %q", got)
+	}
+}
+```
+
+Create `internal/paths/base_windows_test.go` (`//go:build windows`):
+
+```go
+//go:build windows
+
+package paths
+
+import "testing"
+
+func TestBaseDirUsesLocalAppData(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", `C:\Users\tester\AppData\Local`)
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	if got != `C:\Users\tester\AppData\Local` {
+		t.Fatalf("got %q, want LOCALAPPDATA", got)
+	}
+}
+
+func TestBaseDirFallsBackWhenLocalAppDataEmpty(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", "")
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	if got == "" {
+		t.Fatal("baseDir mengembalikan path kosong")
+	}
+}
+```
+
+Create `internal/paths/base_darwin_test.go` (`//go:build darwin`):
+
+```go
+//go:build darwin
+
+package paths
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestBaseDirDarwin(t *testing.T) {
+	got, err := baseDir()
+	if err != nil {
+		t.Fatalf("baseDir error: %v", err)
+	}
+	want := filepath.Join("Library", "Application Support")
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("got %q, want suffix %q", got, want)
 	}
 }
 ```
@@ -184,6 +279,7 @@ import (
 	"runtime"
 )
 
+// Paths adalah lokasi folder data aplikasi dan berkas-berkas yang dikelolanya.
 type Paths struct {
 	DataDir     string
 	AdbDir      string
@@ -222,7 +318,14 @@ func baseDir() (string, error) {
 		if v := os.Getenv("LOCALAPPDATA"); v != "" {
 			return v, nil
 		}
-		return "", fmt.Errorf("variabel LOCALAPPDATA kosong")
+		if v, err := os.UserConfigDir(); err == nil && v != "" {
+			return v, nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, "AppData", "Local"), nil
 	case "darwin":
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -230,7 +333,7 @@ func baseDir() (string, error) {
 		}
 		return filepath.Join(home, "Library", "Application Support"), nil
 	default:
-		if v := os.Getenv("XDG_DATA_HOME"); v != "" {
+		if v := os.Getenv("XDG_DATA_HOME"); v != "" && filepath.IsAbs(v) {
 			return v, nil
 		}
 		home, err := os.UserHomeDir()
@@ -245,15 +348,10 @@ func baseDir() (string, error) {
 func (p Paths) Ensure() error {
 	for _, dir := range []string{p.DataDir, p.AdbDir, p.UploadsDir, p.PulledDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
+			return fmt.Errorf("gagal membuat folder %s: %w", dir, err)
 		}
 	}
 	return nil
-}
-
-func isDir(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && st.IsDir()
 }
 ```
 
@@ -278,6 +376,11 @@ git commit -m "feat(paths): tentukan folder data per OS"
 - Create: `internal/bundle/bundle.go`
 - Test: `internal/bundle/bundle_test.go`
 
+Catatan: unit yang ditanam adalah direktori `bin/<goos>-<goarch>/`. Di Windows
+direktori itu berisi `adb.exe` beserta `AdbWinApi.dll` dan `AdbWinUsbApi.dll`
+yang wajib ikut terekstrak, karena `adb.exe` memuat `AdbWinApi.dll` secara
+statis.
+
 - [ ] **Step 1: Tulis tes yang gagal**
 
 Create `internal/bundle/bundle_test.go`:
@@ -289,9 +392,23 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 )
+
+func assertNoTemps(t *testing.T, dir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob gagal: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("berkas sementara tersisa: %v", matches)
+	}
+}
 
 func TestEnsureFromExtractsBinary(t *testing.T) {
 	fsys := fstest.MapFS{
@@ -349,6 +466,192 @@ func TestEnsureFromErrorsWhenPlatformMissing(t *testing.T) {
 		t.Fatal("seharusnya error saat biner platform tidak ada")
 	}
 }
+
+func TestEnsureFromReextractsWhenVersionChanges(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("baru"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "adb"), []byte("lama"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".version"), []byte("0:linux-amd64"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "adb"))
+	if string(data) != "baru" {
+		t.Fatalf("adb seharusnya diekstrak ulang saat versi berubah, isi: %q", data)
+	}
+}
+
+func TestEnsureFromReextractsWhenBinaryMissing(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi adb"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	first, err := ensureFrom(fsys, dir, "linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ensureFrom(fsys, dir, "linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(second)
+	if err != nil || len(data) == 0 {
+		t.Fatalf("adb seharusnya diekstrak ulang saat biner hilang: %v", err)
+	}
+}
+
+func TestEnsureFromReextractsWhenStampCorrupt(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("baru"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "adb"), []byte("lama"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".version"), []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "adb"))
+	if string(data) != "baru" {
+		t.Fatalf("adb seharusnya diekstrak ulang saat stempel rusak, isi: %q", data)
+	}
+}
+
+func TestEnsureFromExtractsWindowsDLLs(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/windows-amd64/adb.exe":           &fstest.MapFile{Data: []byte("exe"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinApi.dll":     &fstest.MapFile{Data: []byte("api"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinUsbApi.dll":  &fstest.MapFile{Data: []byte("usb"), Mode: 0o644},
+		"bin/windows-amd64/source.properties": &fstest.MapFile{Data: []byte("prop"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	got, err := ensureFrom(fsys, dir, "windows", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(got, "adb.exe") {
+		t.Fatalf("path adb salah: %q", got)
+	}
+	for _, n := range []string{"adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "source.properties"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Fatalf("%s tidak diekstrak: %v", n, err)
+		}
+	}
+}
+
+func TestEnsureFromLeavesNoTempAfterSuccess(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	assertNoTemps(t, dir)
+}
+
+func TestEnsureFromLeavesNoTempAfterFailure(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	// Direktori tujuan yang tidak kosong membuat operasi rename gagal.
+	if err := os.MkdirAll(filepath.Join(dir, "adb", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err == nil {
+		t.Fatal("seharusnya error saat tujuan tidak dapat ditulis")
+	}
+	assertNoTemps(t, dir)
+}
+
+func TestEnsureFromConcurrent(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb":        &fstest.MapFile{Data: []byte("#!/bin/sh\necho hi\n"), Mode: 0o644},
+		"bin/linux-amd64/NOTICE.txt": &fstest.MapFile{Data: []byte("notice"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	const n = 8
+	var wg sync.WaitGroup
+	paths := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			paths[i], errs[i] = ensureFrom(fsys, dir, "linux", "amd64")
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d gagal: %v", i, errs[i])
+		}
+		if paths[i] == "" {
+			t.Fatalf("goroutine %d mengembalikan path kosong", i)
+		}
+	}
+	assertNoTemps(t, dir)
+}
+
+func TestEnsureFromRestoresMissingDLL(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/windows-amd64/adb.exe":          &fstest.MapFile{Data: []byte("exe"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinApi.dll":    &fstest.MapFile{Data: []byte("api"), Mode: 0o644},
+		"bin/windows-amd64/AdbWinUsbApi.dll": &fstest.MapFile{Data: []byte("usb"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "windows", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	dll := filepath.Join(dir, "AdbWinApi.dll")
+	if err := os.Remove(dll); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "windows", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dll); err != nil {
+		t.Fatalf("AdbWinApi.dll seharusnya dipulihkan: %v", err)
+	}
+}
+
+func TestEnsureFromCleansStaleTempOnFastPath(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "adb.tmp-stale")
+	if err := os.WriteFile(stale, []byte("sisa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureFrom(fsys, dir, "linux", "amd64"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("berkas sementara basi seharusnya dihapus, err: %v", err)
+	}
+	assertNoTemps(t, dir)
+}
 ```
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
@@ -385,8 +688,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"time"
 )
 
 // Ensure mengekstrak adb untuk OS saat ini dan mengembalikan path-nya.
@@ -401,67 +706,154 @@ func adbName(goos string) string {
 	return "adb"
 }
 
+// ensureFrom mengekstrak seluruh isi folder bin/<goos>-<goarch>/ ke adbDir.
+// Di Windows, adb.exe memuat AdbWinApi.dll secara statis sehingga DLL tersebut
+// harus ikut diekstrak berdampingan; karena itu unit yang disalin adalah
+// direktori, bukan satu berkas.
 func ensureFrom(fsys fs.FS, adbDir, goos, goarch string) (string, error) {
 	name := adbName(goos)
-	src := fmt.Sprintf("bin/%s-%s/%s", goos, goarch, name)
-	if _, err := fs.Stat(fsys, src); err != nil {
-		return "", fmt.Errorf(
-			"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
-			goos, goarch)
+	srcDir := path.Join("bin", goos+"-"+goarch)
+
+	entries, err := fs.ReadDir(fsys, srcDir)
+	if err != nil {
+		return "", notBundledError(goos, goarch)
+	}
+
+	var files []string
+	hasAdb := false
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		files = append(files, e.Name())
+		if e.Name() == name {
+			hasAdb = true
+		}
+	}
+	if !hasAdb {
+		return "", notBundledError(goos, goarch)
 	}
 
 	dst := filepath.Join(adbDir, name)
 	stamp := filepath.Join(adbDir, ".version")
 	want := Version + ":" + goos + "-" + goarch
 
+	// Bersihkan sisa berkas sementara dari proses yang gagal sebelumnya, bahkan
+	// ketika ekstraksi ulang tidak diperlukan.
+	removeStaleTemps(adbDir)
+
 	if got, err := os.ReadFile(stamp); err == nil && string(got) == want {
-		if _, err := os.Stat(dst); err == nil {
+		if bundledFilesPresent(adbDir, files) {
 			return dst, nil
 		}
 	}
 
 	if err := os.MkdirAll(adbDir, 0o755); err != nil {
-		return "", err
+		return "", fmt.Errorf("membuat folder %s: %w", adbDir, err)
 	}
-	if err := copyFile(fsys, src, dst); err != nil {
-		return "", err
+
+	for _, f := range files {
+		if err := copyFile(fsys, path.Join(srcDir, f), filepath.Join(adbDir, f)); err != nil {
+			return "", err
+		}
 	}
 	if err := os.WriteFile(stamp, []byte(want), 0o644); err != nil {
-		return "", err
+		return "", fmt.Errorf("menulis %s: %w", stamp, err)
 	}
 	return dst, nil
 }
 
+func notBundledError(goos, goarch string) error {
+	return fmt.Errorf(
+		"biner adb untuk %s-%s belum dibundel; jalankan `make fetch-adb` sebelum build",
+		goos, goarch)
+}
+
+// bundledFilesPresent memastikan semua berkas yang seharusnya diekstrak sudah
+// ada sebagai berkas biasa di adbDir. Jika satu saja hilang, ekstraksi ulang
+// perlu dijalankan.
+func bundledFilesPresent(adbDir string, files []string) bool {
+	for _, f := range files {
+		st, err := os.Stat(filepath.Join(adbDir, f))
+		if err != nil || !st.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
+
+// removeStaleTemps membersihkan sisa berkas sementara yang sudah lama
+// tertinggal. Hanya berkas yang lebih tua dari satu jam yang dihapus supaya
+// ekstraksi paralel yang sedang berjalan tidak terganggu.
+func removeStaleTemps(dir string) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-time.Hour)
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && st.ModTime().Before(cutoff) {
+			os.Remove(m)
+		}
+	}
+}
+
 func copyFile(fsys fs.FS, src, dst string) error {
+	info, err := fs.Stat(fsys, src)
+	if err != nil {
+		return fmt.Errorf("membaca %s: %w", src, err)
+	}
 	in, err := fsys.Open(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("membuka %s: %w", src, err)
 	}
 	defer in.Close()
 
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("membuat berkas sementara untuk %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyalin %s: %w", src, err)
 	}
-	if err := out.Close(); err != nil {
-		return err
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyinkronkan %s: %w", dst, err)
 	}
-	if err := os.Chmod(tmp, 0o755); err != nil {
-		return err
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("menutup berkas sementara %s: %w", tmpName, err)
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		return fmt.Errorf("mengatur mode %s: %w", dst, err)
+	}
+
+	if err := os.Rename(tmpName, dst); err != nil {
+		if rmErr := os.Remove(dst); rmErr == nil {
+			if err := os.Rename(tmpName, dst); err == nil {
+				return nil
+			}
+		}
+		if st, statErr := os.Stat(dst); statErr == nil && st.Mode().IsRegular() && st.Size() == info.Size() {
+			// Berkas tujuan sudah ditulis oleh ekstraksi lain yang berjalan
+			// bersamaan; isinya identik, jadi anggap berhasil.
+			return nil
+		}
+		return fmt.Errorf("memindahkan %s ke %s: %w", tmpName, dst, err)
+	}
+	return nil
 }
 ```
 
 - [ ] **Step 4: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/bundle/ -v`
-Expected: PASS untuk ketiga tes.
+Expected: PASS untuk seluruh tes (ekstraksi, ekstraksi ulang, pemulihan berkas
+bundel yang hilang, DLL Windows, tidak ada berkas sementara tertinggal, temp
+basi dibersihkan, dan ekstraksi paralel).
 
 - [ ] **Step 5: Commit**
 
@@ -476,7 +868,16 @@ git commit -m "feat(bundle): ekstrak biner adb tertanam ke folder data"
 
 **Files:**
 - Create: `internal/adbx/adbx.go`
+- Create: `internal/adbx/errors.go` (sementara, isi lengkap di Task 4)
 - Test: `internal/adbx/adbx_test.go`
+
+Catatan semantik penting: bila konteks dibatalkan, `osExec.Run` mengembalikan
+`ctx.Err()` (bukan `*exec.ExitError`) sehingga `errors.Is(err, context.Canceled)`
+dan `errors.Is(err, context.DeadlineExceeded)` bekerja; Task 10 bergantung pada ini
+untuk menandai job yang dibatalkan. `New` juga memasang batas waktu pengaman bawaan
+15 menit untuk setiap perintah agar adb yang menggantung tidak memblokir selamanya;
+batas itu bukan timeout UI, dan pembatalan eksplisit dari antrean tetap berlaku
+seketika.
 
 - [ ] **Step 1: Tulis tes yang gagal**
 
@@ -487,7 +888,14 @@ package adbx
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type fakeExec struct {
@@ -533,7 +941,219 @@ func TestRunWithoutSerialOmitsFlag(t *testing.T) {
 		t.Fatalf("flag -s seharusnya tidak ada: %v", fe.calls[0])
 	}
 }
+
+// blockingExec menunggu konteks selesai lalu mengembalikan ctx.Err(), meniru
+// proses yang dibunuh saat konteks dibatalkan.
+type blockingExec struct{}
+
+func (blockingExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	<-ctx.Done()
+	return Result{}, ctx.Err()
+}
+
+func TestRunPropagatesContextCancellation(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(blockingExec{}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := r.Run(ctx, "shell", "id")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+type deadlineExec struct{}
+
+func (deadlineExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	return Result{}, context.DeadlineExceeded
+}
+
+func TestRunPropagatesDeadlineExceeded(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(deadlineExec{}))
+	_, err := r.Run(context.Background(), "shell", "id")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestRunClassifiesNonZeroExit(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stderr: "error: device offline", ExitCode: 1}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	_, err := r.Run(context.Background(), "shell", "id")
+	if !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("got %v, want ErrDeviceNotFound", err)
+	}
+}
+
+type errorExec struct{ err error }
+
+func (e *errorExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	return Result{}, e.err
+}
+
+func TestRunWrapsNonExitError(t *testing.T) {
+	perr := &fs.PathError{Op: "fork/exec", Path: "/usr/bin/adb", Err: errors.New("no such file")}
+	r := New("/usr/bin/adb", WithExecer(&errorExec{err: perr}))
+	_, err := r.Run(context.Background(), "devices")
+	if err == nil {
+		t.Fatal("ingin error, dapat nil")
+	}
+	if !strings.Contains(err.Error(), "/usr/bin/adb") {
+		t.Fatalf("error harus menyebut path adb: %v", err)
+	}
+	if !strings.Contains(err.Error(), "menjalankan ") {
+		t.Fatalf("error harus memakai pesan yang menyebut subjek: %v", err)
+	}
+	var got *fs.PathError
+	if !errors.As(err, &got) {
+		t.Fatalf("error harus membungkus PathError: %v", err)
+	}
+}
+
+func TestOutputTrimsWhitespace(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: " hello\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.Output(context.Background(), "shell", "echo", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q want %q", got, "hello")
+	}
+}
+
+func TestWithTimeoutZeroOrNegativeMeansNoTimeout(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "ok"}, {Stdout: "ok"}}}
+	for _, d := range []time.Duration{0, -time.Second} {
+		r := New("/usr/bin/adb", WithExecer(fe), WithTimeout(d))
+		if _, err := r.Run(context.Background(), "devices"); err != nil {
+			t.Fatalf("timeout %v: %v", d, err)
+		}
+	}
+}
+
+func TestWithExecerNilKeepsDefault(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(nil))
+	if r.exec == nil {
+		t.Fatal("exec tidak boleh nil")
+	}
+}
+
+func TestNewDefaultTimeout(t *testing.T) {
+	r := New("/usr/bin/adb")
+	if r.timeout != 15*time.Minute {
+		t.Fatalf("timeout bawaan = %v, want 15m", r.timeout)
+	}
+}
+
+// safeExec aman dipakai bersamaan dan merekam seluruh panggilan.
+type safeExec struct {
+	mu    sync.Mutex
+	calls [][]string
+}
+
+func (s *safeExec) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	s.mu.Lock()
+	s.calls = append(s.calls, append([]string{name}, args...))
+	s.mu.Unlock()
+	return Result{Stdout: "ok"}, nil
+}
+
+func TestRunConcurrentSameRunner(t *testing.T) {
+	const n = 8
+	se := &safeExec{}
+	r := New("/usr/bin/adb", WithExecer(se), WithSerial("SER"))
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			arg := fmt.Sprintf("arg-%d", i)
+			if _, err := r.Run(context.Background(), "shell", arg); err != nil {
+				t.Errorf("goroutine %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if len(se.calls) != n {
+		t.Fatalf("harus %d panggilan, dapat %d", n, len(se.calls))
+	}
+	wantPrefix := []string{"/usr/bin/adb", "-s", "SER", "shell"}
+	seen := make(map[string]bool, n)
+	for _, c := range se.calls {
+		if len(c) != 5 {
+			t.Fatalf("jumlah args tak terduga: %v", c)
+		}
+		for i := range wantPrefix {
+			if c[i] != wantPrefix[i] {
+				t.Fatalf("prefix args salah: %v", c)
+			}
+		}
+		seen[c[4]] = true
+	}
+	for i := 0; i < n; i++ {
+		if !seen[fmt.Sprintf("arg-%d", i)] {
+			t.Fatalf("arg-%d hilang (cross-talk): %v", i, se.calls)
+		}
+	}
+}
+
+// TestHelperProcess bukan tes biasa: ia hanya tidur ketika dijalankan sebagai
+// proses anak oleh tes lain.
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("ADBX_HELPER_PROCESS") != "1" {
+		return
+	}
+	time.Sleep(60 * time.Second)
+	os.Exit(0)
+}
+
+func TestOSExecPropagatesCancellation(t *testing.T) {
+	t.Setenv("ADBX_HELPER_PROCESS", "1")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+	_, err := (osExec{}).Run(ctx, os.Args[0], "-test.run=TestHelperProcess")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestRunnerTimeoutFires(t *testing.T) {
+	t.Setenv("ADBX_HELPER_PROCESS", "1")
+	r := New(os.Args[0], WithTimeout(300*time.Millisecond))
+	_, err := r.Run(context.Background(), "-test.run=TestHelperProcess")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestWithSerialClonesRunner(t *testing.T) {
+	r := New("/usr/bin/adb")
+	r2 := r.WithSerial("S9")
+	if got := r.args("devices"); len(got) != 1 || got[0] != "devices" {
+		t.Fatalf("runner asal terubah: %v", got)
+	}
+	got := r2.args("devices")
+	want := []string{"-s", "S9", "devices"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+}
 ```
+
+Dua tes memakai pola helper-process (menjalankan ulang biner tes sebagai proses anak) untuk menguji `osExec` asli: `TestOSExecPropagatesCancellation` (pembatalan nyata) dan `TestRunnerTimeoutFires` (timeout nyata).
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
 
@@ -551,9 +1171,11 @@ package adbx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Result adalah keluaran satu perintah adb.
@@ -564,7 +1186,8 @@ type Result struct {
 }
 
 // Execer menjalankan sebuah program. Implementasi asli memakai os/exec;
-// pengujian menyuntikkan versi tiruan.
+// pengujian menyuntikkan versi tiruan. Implementasi harus aman dipakai
+// bersamaan (concurrent-safe) karena satu Runner dapat dipakai banyak goroutine.
 type Execer interface {
 	Run(ctx context.Context, name string, args ...string) (Result, error)
 }
@@ -579,8 +1202,14 @@ func (osExec) Run(ctx context.Context, name string, args ...string) (Result, err
 	err := cmd.Run()
 	res := Result{Stdout: out.String(), Stderr: errBuf.String()}
 	if err != nil {
+		// Bila konteks dibatalkan, exec.CommandContext membunuh proses dan
+		// mengembalikan *exec.ExitError. Kembalikan ctx.Err() agar pemanggil
+		// dapat mengenali context.Canceled / context.DeadlineExceeded.
+		if cerr := ctx.Err(); cerr != nil {
+			return res, cerr
+		}
 		var ee *exec.ExitError
-		if ok := asExitError(err, &ee); ok {
+		if errors.As(err, &ee) {
 			res.ExitCode = ee.ExitCode()
 			return res, nil
 		}
@@ -594,20 +1223,35 @@ type Runner struct {
 	adbPath string
 	exec    Execer
 	serial  string
+	timeout time.Duration
 }
 
 type Option func(*Runner)
 
+// WithExecer mengganti pelaksana perintah. Nilai nil diabaikan sehingga
+// Runner tetap memakai pelaksana bawaan dan tidak panik saat dipanggil.
 func WithExecer(e Execer) Option {
-	return func(r *Runner) { r.exec = e }
+	return func(r *Runner) {
+		if e != nil {
+			r.exec = e
+		}
+	}
 }
 
 func WithSerial(serial string) Option {
 	return func(r *Runner) { r.serial = serial }
 }
 
+// WithTimeout memberi batas waktu pengaman untuk setiap perintah adb. Nilai
+// nol atau negatif berarti tanpa batas waktu.
+func WithTimeout(d time.Duration) Option {
+	return func(r *Runner) { r.timeout = d }
+}
+
+// New membuat Runner. Batas waktu bawaan 15 menit dipasang sebagai jaring
+// pengaman agar adb yang menggantung tidak memblokir selamanya.
 func New(adbPath string, opts ...Option) *Runner {
-	r := &Runner{adbPath: adbPath, exec: osExec{}}
+	r := &Runner{adbPath: adbPath, exec: osExec{}, timeout: 15 * time.Minute}
 	for _, o := range opts {
 		o(r)
 	}
@@ -615,13 +1259,13 @@ func New(adbPath string, opts ...Option) *Runner {
 }
 
 // WithSerial mengembalikan salinan Runner yang menargetkan serial tertentu.
+// Ini salinan dangkal (shallow): aman hanya selama Runner memegang field
+// skalar/interface saja.
 func (r *Runner) WithSerial(serial string) *Runner {
 	clone := *r
 	clone.serial = serial
 	return &clone
 }
-
-func (r *Runner) Serial() string { return r.serial }
 
 func (r *Runner) args(rest ...string) []string {
 	args := make([]string, 0, len(rest)+2)
@@ -634,9 +1278,14 @@ func (r *Runner) args(rest ...string) []string {
 // Run menjalankan perintah adb. Error yang dikembalikan sudah diterjemahkan
 // bila keluarannya cocok dengan pola kegagalan yang dikenal.
 func (r *Runner) Run(ctx context.Context, rest ...string) (Result, error) {
+	if r.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.timeout)
+		defer cancel()
+	}
 	res, err := r.exec.Run(ctx, r.adbPath, r.args(rest...)...)
 	if err != nil {
-		return res, fmt.Errorf("gagal menjalankan adb: %w", err)
+		return res, fmt.Errorf("menjalankan %s %s: %w", r.adbPath, strings.Join(rest, " "), err)
 	}
 	if res.ExitCode != 0 {
 		return res, Classify(res)
@@ -654,20 +1303,6 @@ func (r *Runner) Output(ctx context.Context, rest ...string) (string, error) {
 }
 ```
 
-Create `internal/adbx/exec_error.go`:
-
-```go
-package adbx
-
-import "errors"
-import "os/exec"
-
-// asExitError memisahkan pengecekan tipe ini agar mudah dibaca di adbx.go.
-func asExitError(err error, target **exec.ExitError) bool {
-	return errors.As(err, target)
-}
-```
-
 - [ ] **Step 4: Tambahkan `Classify` agar tes bisa dikompilasi**
 
 Create `internal/adbx/errors.go` (sementara, isi lengkap di Task 4):
@@ -675,10 +1310,27 @@ Create `internal/adbx/errors.go` (sementara, isi lengkap di Task 4):
 ```go
 package adbx
 
+import (
+	"errors"
+	"strings"
+)
+
+// ErrDeviceNotFound dikembalikan bila adb melaporkan perangkat tidak ada atau
+// sedang offline. Sentinel lain serta daftar pola lengkap ditambahkan pada Task 4.
+var ErrDeviceNotFound = errors.New("perangkat tidak ditemukan")
+
 // Classify menerjemahkan keluaran adb yang gagal menjadi error yang jelas.
 // Daftar lengkap pola ditambahkan pada Task 4.
 func Classify(res Result) error {
-	return &CommandError{Result: res}
+	lower := strings.ToLower(res.Stderr + "\n" + res.Stdout)
+	switch {
+	case strings.Contains(lower, "device not found"),
+		strings.Contains(lower, "device offline"),
+		strings.Contains(lower, "no devices/emulators found"):
+		return ErrDeviceNotFound
+	default:
+		return &CommandError{Result: res}
+	}
 }
 
 // CommandError adalah kegagalan adb yang belum dikenali polanya.
@@ -707,10 +1359,17 @@ func firstLine(s string) string {
 }
 ```
 
+Catatan: tes `TestRunClassifiesNonZeroExit` memakai `ErrDeviceNotFound` supaya
+jalur "exit code != 0 diproses `Classify`" bisa diverifikasi sejak Task 3; Task 4
+mengganti seluruh isi `errors.go` dengan daftar sentinel dan pola yang lengkap.
+Catatan: pola `strings.Contains(lower, "device not found")` di sini belum
+menangkap nomor seri (`device 'SERIAL' not found`); perbaikan lengkapnya ada di
+Task 4 lewat `looksLikeDeviceNotFound`.
+
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/adbx/ -v`
-Expected: PASS untuk kedua tes.
+Expected: PASS untuk seluruh tes.
 
 - [ ] **Step 6: Commit**
 
@@ -771,6 +1430,26 @@ func TestClassifyKnownFailures(t *testing.T) {
 			wantErr: ErrDowngrade,
 		},
 		{
+			name:    "signature mismatch",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package com.foo signatures do not match previously installed version]", ExitCode: 1},
+			wantErr: ErrSignatureMismatch,
+		},
+		{
+			name:    "invalid apk",
+			res:     Result{Stderr: "Failure [INSTALL_PARSE_FAILED_NOT_APK]", ExitCode: 1},
+			wantErr: ErrInvalidApk,
+		},
+		{
+			name:    "older sdk",
+			res:     Result{Stderr: "Failure [INSTALL_FAILED_OLDER_SDK]", ExitCode: 1},
+			wantErr: ErrNeedsNewerAndroid,
+		},
+		{
+			name:    "shell permission denied",
+			res:     Result{Stderr: "shell: permission denied", ExitCode: 1},
+			wantErr: ErrShellPermission,
+		},
+		{
 			name:    "package not found",
 			res:     Result{Stderr: "Failure [DELETE_FAILED_INTERNAL_ERROR]\nFailure [not installed for 0]", ExitCode: 1},
 			wantErr: ErrPackageNotFound,
@@ -797,6 +1476,78 @@ func TestClassifyUnknownFallsBackToCommandError(t *testing.T) {
 	var ce *CommandError
 	if !errors.As(err, &ce) {
 		t.Fatalf("seharusnya CommandError, dapat %T", err)
+	}
+	if got, want := err.Error(), "perintah adb gagal: sesuatu yang aneh"; got != want {
+		t.Fatalf("pesan salah: got %q, want %q", got, want)
+	}
+}
+
+func TestClassifyNewSentinelMessages(t *testing.T) {
+	cases := []struct {
+		name string
+		res  Result
+		want error
+		msg  string
+	}{
+		{
+			name: "signature mismatch",
+			res:  Result{Stderr: "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]"},
+			want: ErrSignatureMismatch,
+			msg:  "aplikasi dengan nama paket sama sudah terpasang dengan tanda tangan berbeda; copot dulu yang lama",
+		},
+		{
+			name: "invalid apk",
+			res:  Result{Stderr: "Failure [INSTALL_PARSE_FAILED_NOT_APK]"},
+			want: ErrInvalidApk,
+			msg:  "berkas APK tidak sah atau tidak ditandatangani",
+		},
+		{
+			name: "older sdk",
+			res:  Result{Stderr: "Failure [INSTALL_FAILED_OLDER_SDK]"},
+			want: ErrNeedsNewerAndroid,
+			msg:  "APK ini butuh versi Android yang lebih baru",
+		},
+		{
+			name: "shell permission",
+			res:  Result{Stderr: "Security exception: insufficient permissions"},
+			want: ErrShellPermission,
+			msg:  "perangkat menolak perintah ini (izin shell kurang)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Classify(tc.res)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			if got := err.Error(); got != tc.msg {
+				t.Fatalf("pesan salah: got %q, want %q", got, tc.msg)
+			}
+		})
+	}
+}
+
+func TestClassifyDoesNotBridgeLines(t *testing.T) {
+	// "not found" tanpa penanda "device" bukan device-not-found.
+	err := Classify(Result{Stderr: "package com.foo not found", ExitCode: 1})
+	if errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("tidak boleh ErrDeviceNotFound: %v", err)
+	}
+	var ce *CommandError
+	if !errors.As(err, &ce) {
+		t.Fatalf("seharusnya CommandError, dapat %T", err)
+	}
+
+	// "device ..." di satu baris tidak boleh dijembatani dengan "not found" di
+	// baris lain.
+	err = Classify(Result{
+		Stderr:   "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]",
+		Stdout:   "device status: ok\nremote object not found",
+		ExitCode: 1,
+	})
+	if !errors.Is(err, ErrInsufficientStorage) {
+		t.Fatalf("got %v, want ErrInsufficientStorage", err)
 	}
 }
 ```
@@ -826,6 +1577,10 @@ var (
 	ErrDowngrade           = errors.New("versi lebih rendah dari yang terpasang")
 	ErrPackageNotFound     = errors.New("aplikasi tidak terpasang")
 	ErrSystemApp           = errors.New("aplikasi sistem tidak boleh dicopot")
+	ErrSignatureMismatch   = errors.New("aplikasi dengan nama paket sama sudah terpasang dengan tanda tangan berbeda; copot dulu yang lama")
+	ErrInvalidApk          = errors.New("berkas APK tidak sah atau tidak ditandatangani")
+	ErrNeedsNewerAndroid   = errors.New("APK ini butuh versi Android yang lebih baru")
+	ErrShellPermission     = errors.New("perangkat menolak perintah ini (izin shell kurang)")
 )
 
 // Classify menerjemahkan keluaran adb yang gagal menjadi error yang bisa
@@ -838,11 +1593,22 @@ func Classify(res Result) error {
 	switch {
 	case strings.Contains(lower, "not installed for"):
 		return ErrPackageNotFound
+	case strings.Contains(lower, "update_incompatible"),
+		strings.Contains(lower, "signatures do not match"):
+		return ErrSignatureMismatch
+	case strings.Contains(lower, "parse_failed"),
+		strings.Contains(lower, "invalid_apk"):
+		return ErrInvalidApk
+	case strings.Contains(lower, "older_sdk"),
+		strings.Contains(lower, "requires newer sdk"):
+		return ErrNeedsNewerAndroid
 	case strings.Contains(lower, "device unauthorized"),
-		strings.Contains(lower, "insufficient permissions"),
 		strings.Contains(lower, "unauthorized"):
 		return ErrUnauthorized
-	case strings.Contains(lower, "device not found"),
+	case strings.Contains(lower, "insufficient permissions"),
+		strings.Contains(lower, "permission denied"):
+		return ErrShellPermission
+	case looksLikeDeviceNotFound(lower),
 		strings.Contains(lower, "device offline"),
 		strings.Contains(lower, "no devices/emulators found"):
 		return ErrDeviceNotFound
@@ -853,6 +1619,11 @@ func Classify(res Result) error {
 	case strings.Contains(lower, "version_downgrade"):
 		return ErrDowngrade
 	case strings.Contains(lower, "delete_failed"):
+		// Heuristik: DELETE_FAILED_INTERNAL_ERROR biasanya berarti paket
+		// sistem tidak boleh dicopot, tetapi kadang hanya berarti paketnya
+		// sudah tidak ada. Arm "not installed for" di atas lebih dulu,
+		// sehingga kasus paket hilang tetap terklasifikasi benar bila kedua
+		// penanda muncul bersamaan.
 		return ErrSystemApp
 	default:
 		return &CommandError{Result: res}
@@ -870,9 +1641,9 @@ func (e *CommandError) Error() string {
 		msg = firstLine(e.Result.Stdout)
 	}
 	if msg == "" {
-		msg = "perintah adb gagal"
+		msg = "tanpa keluaran"
 	}
-	return msg
+	return "perintah adb gagal: " + msg
 }
 
 func firstLine(s string) string {
@@ -883,7 +1654,27 @@ func firstLine(s string) string {
 	}
 	return strings.TrimSpace(s)
 }
+
+// looksLikeDeviceNotFound cocok untuk pola "device not found" maupun
+// "device 'SERIAL' not found". strings.Contains(lower, "device not found")
+// tidak cukup karena adb menyisipkan nomor seri di antara "device" dan
+// "not found". Pemeriksaan dilakukan per baris supaya keluaran stderr dan
+// stdout tidak saling menjembatani pola.
+func looksLikeDeviceNotFound(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		i := strings.Index(line, "device")
+		if i >= 0 && strings.Contains(line[i:], "not found") {
+			return true
+		}
+	}
+	return false
+}
 ```
+
+Catatan: urutan `case` di `Classify` bersifat penting dan tidak boleh diubah
+sembarangan. `not installed for` harus diperiksa sebelum `delete_failed`, dan
+pola `unauthorized` sebelum device-not-found, karena satu keluaran adb dapat
+memuat beberapa penanda sekaligus.
 
 - [ ] **Step 4: Pastikan tidak ada kode sisa**
 
@@ -922,6 +1713,7 @@ package adbx
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -945,6 +1737,12 @@ func TestDevicesParsesLines(t *testing.T) {
 	}
 	if got[0].Serial != "R58M12ABCDE" || got[0].State != "device" || got[0].Model != "SM_G973F" {
 		t.Fatalf("baris pertama salah: %+v", got[0])
+	}
+	if got[0].Product != "beyond1lte" || got[0].DeviceName != "beyond1" {
+		t.Fatalf("product/device baris pertama salah: %+v", got[0])
+	}
+	if got[1].Serial != "0123456789ABCDEF" {
+		t.Fatalf("serial baris kedua salah: %+v", got[1])
 	}
 	if got[1].State != "unauthorized" {
 		t.Fatalf("baris kedua salah: %+v", got[1])
@@ -995,6 +1793,102 @@ func TestPackagesFallsBackWhenVersionCodeUnsupported(t *testing.T) {
 	if !strings.Contains(strings.Join(callsOf(fe), " "), "pm list packages") {
 		t.Fatal("perintah pm list packages tidak dijalankan")
 	}
+	calls := callsOf(fe)
+	if len(calls) < 2 {
+		t.Fatalf("harus 2 panggilan: %v", calls)
+	}
+	if strings.Contains(calls[1], "--show-versioncode") {
+		t.Fatalf("panggilan kedua tidak boleh memakai --show-versioncode: %q", calls[1])
+	}
+}
+
+func TestPackagesRetriesWhenFirstCallParsesEmpty(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "Unknown option: --show-versioncode"},
+		{Stdout: packagesSample},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("harus 2 paket, dapat %d: %+v", len(got), got)
+	}
+	calls := callsOf(fe)
+	if len(calls) != 2 {
+		t.Fatalf("harus 2 panggilan: %v", calls)
+	}
+	if strings.Contains(calls[1], "--show-versioncode") {
+		t.Fatalf("panggilan kedua tidak boleh memakai --show-versioncode: %q", calls[1])
+	}
+}
+
+func TestPackagesEmptyLegitDoesNotRetry(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: ""}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("harus 0 paket, dapat %d", len(got))
+	}
+	if calls := callsOf(fe); len(calls) != 1 {
+		t.Fatalf("daftar kosong yang wajar tidak boleh memicu panggilan ulang: %v", calls)
+	}
+}
+
+func TestPackagesSystemUsesSFlag(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: packagesSample}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	got, err := r.Packages(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(callsOf(fe), " "), "list packages -s") {
+		t.Fatalf("flag -s tidak dipakai: %v", callsOf(fe))
+	}
+	if len(got) != 2 || !got[0].System {
+		t.Fatalf("paket sistem tidak ditandai: %+v", got)
+	}
+}
+
+func TestParseDevicesLineTable(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want []Device
+	}{
+		{
+			name: "baris daemon * dilewati",
+			line: "* daemon not running; starting now at tcp:5037",
+			want: nil,
+		},
+		{
+			name: "no permissions dipetakan ke offline",
+			line: "????????????\tno permissions (user in plugdev group; are your udev rules wrong?)",
+			want: []Device{{Serial: "????????????", State: "offline"}},
+		},
+		{
+			name: "status tak dikenal dipetakan ke offline",
+			line: "ABC123\tfrobnicating transport_id:9",
+			want: []Device{{Serial: "ABC123", State: "offline"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseDevices(tc.line)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %+v want %+v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i].Serial != tc.want[i].Serial || got[i].State != tc.want[i].State {
+					t.Fatalf("got %+v want %+v", got, tc.want)
+				}
+			}
+		})
+	}
 }
 
 func callsOf(fe *fakeExec) []string {
@@ -1033,17 +1927,95 @@ func TestPackageInfoParsesDumpsys(t *testing.T) {
 	if got.VersionName != "1.2.3" || got.VersionCode != 42 {
 		t.Fatalf("versi salah: %+v", got)
 	}
+	if got.ApkPath != "/data/app/~~Ab==/com.example.app-x==/base.apk" {
+		t.Fatalf("apkPath salah: %q", got.ApkPath)
+	}
+	if got.InstallTime != "2024-01-01 10:00:00" {
+		t.Fatalf("installTime salah: %q", got.InstallTime)
+	}
+	if got.UpdateTime != "2024-02-02 11:00:00" {
+		t.Fatalf("updateTime salah: %q", got.UpdateTime)
+	}
 	if got.DataDir != "/data/user/0/com.example.app" {
 		t.Fatalf("dataDir salah: %q", got.DataDir)
 	}
 	if len(got.Permissions) != 2 {
 		t.Fatalf("izin salah: %+v", got.Permissions)
 	}
+	if got.Permissions[0] != "android.permission.INTERNET" ||
+		got.Permissions[1] != "android.permission.CAMERA" {
+		t.Fatalf("nilai izin salah: %+v", got.Permissions)
+	}
 	if got.System {
 		t.Fatal("paket di /data/app bukan aplikasi sistem")
 	}
 	if got.SizeBytes != 1234*1024 {
 		t.Fatalf("ukuran salah: %d", got.SizeBytes)
+	}
+}
+
+func TestPackageInfoParsesNamespacedPermissions(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"      android.permission.CAMERA",
+		"      android.permission.CAMERA\n      org.example.permission.FOO\n      com.vendor.permission.BAR", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Permissions) != 4 {
+		t.Fatalf("izin salah: %+v", got.Permissions)
+	}
+	if got.Permissions[2] != "org.example.permission.FOO" ||
+		got.Permissions[3] != "com.vendor.permission.BAR" {
+		t.Fatalf("izin namespace salah: %+v", got.Permissions)
+	}
+}
+
+func TestPackageInfoGarbageReturnsNotFound(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "bukan keluaran dumpsys"}}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	_, err := r.PackageInfo(context.Background(), "com.example.app")
+	if !errors.Is(err, ErrPackageNotFound) {
+		t.Fatalf("got %v, want ErrPackageNotFound", err)
+	}
+}
+
+func TestPackageInfoWithoutVersionName(t *testing.T) {
+	sample := strings.Replace(dumpsysSample, "    versionName=1.2.3\n", "", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/data/user/0/com.example.app"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.VersionName != "" || got.DataDir != "/data/user/0/com.example.app" {
+		t.Fatalf("hasil salah: %+v", got)
+	}
+}
+
+func TestPackageInfoMarksApexAsSystem(t *testing.T) {
+	sample := strings.Replace(dumpsysSample,
+		"codePath=/data/app/~~Ab==/com.example.app-x==/base.apk",
+		"codePath=/apex/com.android.foo/foo.apk", 1)
+	fe := &fakeExec{results: []Result{
+		{Stdout: sample},
+		{Stdout: "10\t/apex/com.android.foo"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe))
+	got, err := r.PackageInfo(context.Background(), "com.example.app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.System {
+		t.Fatal("paket di /apex harus ditandai sistem")
 	}
 }
 
@@ -1096,24 +2068,24 @@ type Device struct {
 
 // Package adalah satu aplikasi yang terpasang di perangkat.
 type Package struct {
-	Name        string
-	ApkPath     string
-	VersionCode int64
-	System      bool
+	Name        string `json:"name"`
+	ApkPath     string `json:"apkPath,omitempty"`
+	VersionCode int64  `json:"versionCode,omitempty"`
+	System      bool   `json:"system,omitempty"`
 }
 
 // PackageInfo adalah detail satu aplikasi, untuk panel detail di UI.
 type PackageInfo struct {
-	Package     string
-	VersionName string
-	VersionCode int64
-	InstallTime string
-	UpdateTime  string
-	ApkPath     string
-	DataDir     string
-	SizeBytes   int64
-	Permissions []string
-	System      bool
+	Package     string   `json:"package"`
+	VersionName string   `json:"versionName,omitempty"`
+	VersionCode int64    `json:"versionCode,omitempty"`
+	InstallTime string   `json:"installTime,omitempty"`
+	UpdateTime  string   `json:"updateTime,omitempty"`
+	ApkPath     string   `json:"apkPath,omitempty"`
+	DataDir     string   `json:"dataDir,omitempty"`
+	SizeBytes   int64    `json:"sizeBytes,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+	System      bool     `json:"system,omitempty"`
 }
 
 func (r *Runner) Devices(ctx context.Context) ([]Device, error) {
@@ -1137,7 +2109,7 @@ func parseDevices(out string) []Device {
 		if len(fields) < 2 {
 			continue
 		}
-		d := Device{Serial: fields[0], State: fields[1]}
+		d := Device{Serial: fields[0], State: normalizeState(fields[1])}
 		for _, f := range fields[2:] {
 			k, v, ok := strings.Cut(f, ":")
 			if !ok {
@@ -1157,6 +2129,18 @@ func parseDevices(out string) []Device {
 	return devs
 }
 
+// normalizeState memetakan status yang tidak dikenal (misalnya baris
+// "no permissions (user in plugdev group; are your udev rules wrong?)") ke
+// "offline" supaya UI tidak menampilkan string yang kacau.
+func normalizeState(s string) string {
+	switch s {
+	case "device", "unauthorized", "offline", "bootloader", "recovery", "sideload", "rescue", "authorizing":
+		return s
+	default:
+		return "offline"
+	}
+}
+
 // Packages mengembalikan daftar aplikasi. system=true meminta aplikasi sistem.
 func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 	flag := "-3"
@@ -1164,14 +2148,32 @@ func (r *Runner) Packages(ctx context.Context, system bool) ([]Package, error) {
 		flag = "-s"
 	}
 	out, err := r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f", "--show-versioncode")
+	retried := false
 	if err != nil {
 		// Perangkat lama belum mendukung --show-versioncode.
 		out, err = r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f")
 		if err != nil {
 			return nil, err
 		}
+		retried = true
 	}
-	return parsePackages(out, system), nil
+	pkgs := parsePackages(out, system)
+	if len(pkgs) == 0 && !retried && looksLikeUnsupportedFlag(out) {
+		// Sebagian build adb mencetak "Unknown option" ke stdout tetapi tetap
+		// keluar dengan status 0; ulangi tanpa --show-versioncode.
+		if out2, err2 := r.Output(ctx, "shell", "pm", "list", "packages", flag, "-f"); err2 == nil {
+			pkgs = parsePackages(out2, system)
+		}
+	}
+	return pkgs, nil
+}
+
+// looksLikeUnsupportedFlag mendeteksi keluaran yang menandakan flag tidak
+// dikenali, supaya daftar kosong yang wajar tidak memicu panggilan ulang.
+func looksLikeUnsupportedFlag(out string) bool {
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "unknown option") ||
+		strings.Contains(lower, "error")
 }
 
 func parsePackages(out string, system bool) []Package {
@@ -1214,6 +2216,8 @@ func (r *Runner) PackageInfo(ctx context.Context, pkg string) (PackageInfo, erro
 		return PackageInfo{}, fmt.Errorf("%w: %s", ErrPackageNotFound, pkg)
 	}
 	if info.DataDir != "" {
+		// Bila `du` gagal, SizeBytes tetap 0 yang berarti "ukuran tidak
+		// diketahui".
 		if size, err := r.Output(ctx, "shell", "du", "-sk", info.DataDir); err == nil {
 			info.SizeBytes = parseDU(size)
 		}
@@ -1222,20 +2226,26 @@ func (r *Runner) PackageInfo(ctx context.Context, pkg string) (PackageInfo, erro
 }
 
 func parseDumpsys(pkg, out string) PackageInfo {
-	info := PackageInfo{Package: pkg}
+	info := PackageInfo{}
+	found := false
 	inPermissions := false
 	for _, raw := range strings.Split(out, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
+		if !found && strings.HasPrefix(line, "Package [") {
+			// Kehadiran paket dideteksi dari header "Package [<nama>]", bukan
+			// dari kelengkapan field versi.
+			found = true
+			info.Package = pkg
+		}
 		if line == "requested permissions:" {
 			inPermissions = true
 			continue
 		}
 		if inPermissions {
-			if strings.HasPrefix(line, "android.permission.") ||
-				strings.HasPrefix(line, "com.") {
+			if strings.Contains(line, ".permission.") {
 				info.Permissions = append(info.Permissions, line)
 				continue
 			}
@@ -1264,12 +2274,16 @@ func parseDumpsys(pkg, out string) PackageInfo {
 			info.DataDir = value
 		}
 	}
-	if info.VersionName == "" || info.ApkPath == "" {
+	if !found {
 		return PackageInfo{}
 	}
+	// Paket sistem biasanya berada di /system, /product, /vendor, atau /apex.
+	// Ini heuristik: aplikasi sistem yang diperbarui dapat berpindah ke
+	// /data/app sehingga tidak lagi terdeteksi sebagai sistem.
 	info.System = strings.HasPrefix(info.ApkPath, "/system") ||
 		strings.HasPrefix(info.ApkPath, "/product") ||
-		strings.HasPrefix(info.ApkPath, "/vendor")
+		strings.HasPrefix(info.ApkPath, "/vendor") ||
+		strings.HasPrefix(info.ApkPath, "/apex")
 	return info
 }
 
@@ -1319,6 +2333,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstallSuccessReportsStages(t *testing.T) {
@@ -1339,6 +2354,33 @@ func TestInstallSuccessReportsStages(t *testing.T) {
 	}
 }
 
+func TestInstallFlagsAndStageSequence(t *testing.T) {
+	fe := &fakeExec{results: []Result{{Stdout: "Success\n"}}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	var stages []int
+	err := r.Install(context.Background(), "/tmp/app.apk",
+		InstallOptions{Replace: true, AllowDowngrade: true, GrantAll: true},
+		func(percent int, msg string) { stages = append(stages, percent) })
+	if err != nil {
+		t.Fatalf("install gagal: %v", err)
+	}
+	joined := strings.Join(fe.calls[0], " ")
+	for _, flag := range []string{"-r", "-d", "-g"} {
+		if !strings.Contains(joined, flag) {
+			t.Fatalf("flag %s tidak ada: %s", flag, joined)
+		}
+	}
+	want := []int{5, 20, 100}
+	if len(stages) != len(want) {
+		t.Fatalf("stages = %v, want %v", stages, want)
+	}
+	for i := range want {
+		if stages[i] != want[i] {
+			t.Fatalf("stages = %v, want %v", stages, want)
+		}
+	}
+}
+
 func TestInstallFailureUsesClassify(t *testing.T) {
 	fe := &fakeExec{results: []Result{{Stdout: "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]\n"}}}
 	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
@@ -1356,6 +2398,65 @@ func TestInstallNonZeroExitIsClassified(t *testing.T) {
 	err := r.Install(context.Background(), "/tmp/app.apk", InstallOptions{}, nil)
 	if !errors.Is(err, ErrDeviceNotFound) {
 		t.Fatalf("got %v, want ErrDeviceNotFound", err)
+	}
+}
+
+// TestInstallExitZeroFailureClassified memastikan "Failure [..]" dengan exit 0
+// tetap diklasifikasikan sebagai kegagalan.
+func TestInstallExitZeroFailureClassified(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "Failure [INSTALL_FAILED_ALREADY_EXISTS]\n"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	err := r.Install(context.Background(), "/tmp/app.apk", InstallOptions{}, nil)
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("got %v, want ErrAlreadyExists", err)
+	}
+}
+
+// TestInstallFalseSuccessFromPathNotSwallowed meniru adb asli yang menggemakan
+// path APK di stderr: path yang memuat kata "Success" tidak boleh menyamarkan
+// kegagalan.
+func TestInstallFalseSuccessFromPathNotSwallowed(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{
+			Stdout:   "Failure [INSTALL_PARSE_FAILED_NOT_APK]\n",
+			Stderr:   "adb: failed to install /tmp/Success/app.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK]\n",
+			ExitCode: 1,
+		},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	err := r.Install(context.Background(), "/tmp/app.apk", InstallOptions{}, nil)
+	if err == nil {
+		t.Fatal("kegagalan palsu: install seharusnya error")
+	}
+	if !errors.Is(err, ErrInvalidApk) {
+		t.Fatalf("got %v, want ErrInvalidApk", err)
+	}
+}
+
+// TestResultOfRejectsSuccessSubstring memastikan helper bersama hanya menerima
+// baris utuh "Success" dengan exit 0, bukan kemunculan kata di mana pun.
+func TestResultOfRejectsSuccessSubstring(t *testing.T) {
+	res := Result{Stdout: "Failure [...NOT_APK] /tmp/Success/app.apk\n", ExitCode: 0}
+	if err := resultOf(res); err == nil {
+		t.Fatal("path yang memuat \"Success\" tidak boleh dianggap sukses")
+	}
+	if err := resultOf(Result{Stdout: "Success\n", ExitCode: 0}); err != nil {
+		t.Fatalf("baris utuh Success harus sukses, dapat %v", err)
+	}
+}
+
+func TestInstallHonoursRunnerTimeout(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(blockingExec{}), WithSerial("S1"),
+		WithTimeout(50*time.Millisecond))
+	start := time.Now()
+	err := r.Install(context.Background(), "/tmp/app.apk", InstallOptions{}, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("install tidak menghormati timeout: %v", elapsed)
 	}
 }
 
@@ -1381,6 +2482,32 @@ func TestUninstallFailureIsClassified(t *testing.T) {
 	}
 }
 
+// TestUninstallExitZeroFailureIsError membunuh mutan `if res.ExitCode == 0 {
+// return nil }`: "Failure [..]" dengan exit 0 harus tetap error.
+func TestUninstallExitZeroFailureIsError(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "Failure [DELETE_FAILED_INTERNAL_ERROR]\n"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	err := r.Uninstall(context.Background(), "com.foo", false)
+	if !errors.Is(err, ErrSystemApp) {
+		t.Fatalf("got %v, want ErrSystemApp", err)
+	}
+}
+
+func TestUninstallHonoursRunnerTimeout(t *testing.T) {
+	r := New("/usr/bin/adb", WithExecer(blockingExec{}), WithSerial("S1"),
+		WithTimeout(50*time.Millisecond))
+	start := time.Now()
+	err := r.Uninstall(context.Background(), "com.foo", false)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("uninstall tidak menghormati timeout: %v", elapsed)
+	}
+}
+
 func TestClearData(t *testing.T) {
 	fe := &fakeExec{results: []Result{{Stdout: "Success\n"}}}
 	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
@@ -1395,8 +2522,13 @@ func TestClearData(t *testing.T) {
 func TestClearDataFailure(t *testing.T) {
 	fe := &fakeExec{results: []Result{{Stdout: "Failed\n"}}}
 	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
-	if err := r.ClearData(context.Background(), "com.foo"); err == nil {
+	err := r.ClearData(context.Background(), "com.foo")
+	if err == nil {
 		t.Fatal("seharusnya error")
+	}
+	// Pesan harus kontekstual, bukan sekadar "Failed".
+	if !strings.Contains(err.Error(), "com.foo") {
+		t.Fatalf("error harus menyebut nama paket: %v", err)
 	}
 }
 
@@ -1426,6 +2558,28 @@ func TestPullApkFailsWhenPackageMissing(t *testing.T) {
 	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
 	if _, err := r.PullApk(context.Background(), "com.foo", t.TempDir()); !errors.Is(err, ErrPackageNotFound) {
 		t.Fatalf("got %v, want ErrPackageNotFound", err)
+	}
+}
+
+// TestPullApkSanitizesPackageName memastikan nama paket bermusuhan tidak bisa
+// membawa berkas keluar dari direktori tujuan.
+func TestPullApkSanitizesPackageName(t *testing.T) {
+	fe := &fakeExec{results: []Result{
+		{Stdout: "package:/data/app/base.apk\n"},
+		{Stdout: "1 file pulled\n"},
+	}}
+	r := New("/usr/bin/adb", WithExecer(fe), WithSerial("S1"))
+	dest := t.TempDir()
+	got, err := r.PullApk(context.Background(), `../../etc/passwd`, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(filepath.Clean(got)) != dest {
+		t.Fatalf("berkas keluar dari destDir: %q (dest %q)", got, dest)
+	}
+	rel, err := filepath.Rel(dest, got)
+	if err != nil || rel == ".." || strings.ContainsRune(rel, filepath.Separator) {
+		t.Fatalf("path hasil tidak aman: %q", got)
 	}
 }
 ```
@@ -1480,27 +2634,41 @@ func (r *Runner) Install(ctx context.Context, apkPath string, opts InstallOption
 	}
 	args = append(args, apkPath)
 
-	report(stage, 5, "Mengirim APK ke perangkat...")
-	res, err := r.exec.Run(ctx, r.adbPath, r.args(args...)...)
+	report(stage, 5, "Menyiapkan APK...")
+	report(stage, 20, "Mengirim dan memasang APK...")
+	res, err := r.Run(ctx, args...)
 	if err != nil {
-		return fmt.Errorf("gagal menjalankan adb: %w", err)
+		return err
 	}
-	report(stage, 90, "Memasang...")
-	if err := installResult(res); err != nil {
+	if err := resultOf(res); err != nil {
 		return err
 	}
 	report(stage, 100, "Selesai")
 	return nil
 }
 
-// installResult memeriksa keluaran `adb install`, yang bisa melaporkan
-// kegagalan lewat teks "Failure [..]" walau exit code-nya 0.
-func installResult(res Result) error {
-	out := res.Stdout + "\n" + res.Stderr
-	if strings.Contains(out, "Success") {
+// resultOf menafsirkan keluaran perintah adb yang keluar dengan status 0.
+// Sebagian build adb (mis. `install`/`uninstall`) melaporkan kegagalan lewat
+// teks "Failure [..]" meski exit code-nya 0, jadi sukses hanya diakui bila
+// exit code 0 DAN stdout memuat satu baris utuh berisi "Success". Semua kasus
+// lain diklasifikasikan sebagai kegagalan.
+func resultOf(res Result) error {
+	if res.ExitCode == 0 && hasSuccessLine(res.Stdout) {
 		return nil
 	}
 	return Classify(res)
+}
+
+// hasSuccessLine true bila stdout memuat baris yang setelah dipangkas persis
+// sama dengan "Success". Pencocokan baris utuh mencegah jalur APK yang
+// kebetulan mengandung kata "Success" menyamarkan kegagalan.
+func hasSuccessLine(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "Success" {
+			return true
+		}
+	}
+	return false
 }
 
 // Uninstall mencopot aplikasi. keepData=true menyisakan data aplikasi (-k).
@@ -1511,38 +2679,34 @@ func (r *Runner) Uninstall(ctx context.Context, pkg string, keepData bool) error
 	}
 	args = append(args, pkg)
 
-	res, err := r.exec.Run(ctx, r.adbPath, r.args(args...)...)
+	res, err := r.Run(ctx, args...)
 	if err != nil {
-		return fmt.Errorf("gagal menjalankan adb: %w", err)
+		return err
 	}
-	out := res.Stdout + "\n" + res.Stderr
-	if strings.Contains(out, "Success") {
-		return nil
-	}
-	return Classify(res)
+	return resultOf(res)
 }
 
 // ClearData menghapus data dan cache aplikasi tanpa mencopotnya.
 func (r *Runner) ClearData(ctx context.Context, pkg string) error {
-	res, err := r.exec.Run(ctx, r.adbPath, r.args("shell", "pm", "clear", pkg)...)
+	res, err := r.Run(ctx, "shell", "pm", "clear", pkg)
 	if err != nil {
-		return fmt.Errorf("gagal menjalankan adb: %w", err)
+		// r.Run sudah mengklasifikasikan exit code non-nol.
+		return err
 	}
 	out := strings.TrimSpace(res.Stdout)
-	if strings.Contains(out, "Success") {
+	if hasSuccessLine(res.Stdout) {
 		return nil
-	}
-	if res.ExitCode != 0 {
-		return Classify(res)
 	}
 	if out == "" {
 		out = "perangkat menolak menghapus data"
 	}
-	return fmt.Errorf("%s", out)
+	return fmt.Errorf("gagal menghapus data %s: %s", pkg, out)
 }
 
-// PullApk menyalin APK yang terpasang di perangkat ke destDir dan
-// mengembalikan path lokalnya.
+// PullApk menyalin berkas APK yang terpasang di perangkat ke destDir dan
+// mengembalikan path lokalnya. Hanya base APK yang diambil; APK terpisah
+// (split APKs) di luar cakupan v1. Menarik ulang paket yang sama akan
+// menimpa berkas tujuan sebelumnya (adb pull menimpa tanpa bertanya).
 func (r *Runner) PullApk(ctx context.Context, pkg string, destDir string) (string, error) {
 	out, err := r.Output(ctx, "shell", "pm", "path", pkg)
 	if err != nil {
@@ -1559,11 +2723,25 @@ func (r *Runner) PullApk(ctx context.Context, pkg string, destDir string) (strin
 	if remote == "" {
 		return "", fmt.Errorf("%w: %s", ErrPackageNotFound, pkg)
 	}
-	local := filepath.Join(destDir, pkg+"-"+path.Base(remote))
+	local := filepath.Join(destDir, sanitizeName(pkg)+"-"+path.Base(remote))
 	if _, err := r.Run(ctx, "pull", remote, local); err != nil {
 		return "", err
 	}
 	return local, nil
+}
+
+// sanitizeName mengganti karakter yang tidak sah dalam nama berkas dengan
+// garis bawah. Ini mencakup pemisah path (`\` dan `/`) serta karakter yang
+// terlarang di Windows (`: * ? " < > |`), sehingga nama paket yang bermusuhan
+// tidak bisa dipakai untuk menulis keluar dari destDir.
+func sanitizeName(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\\', '/', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		}
+		return r
+	}, s)
 }
 ```
 
@@ -1596,7 +2774,9 @@ package device
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/herlangga72/adbapp/internal/adbx"
 )
@@ -1608,6 +2788,29 @@ type fakeLister struct {
 
 func (f fakeLister) Devices(ctx context.Context) ([]adbx.Device, error) {
 	return f.devices, f.err
+}
+
+// scriptedLister mengembalikan daftar perangkat yang berbeda pada tiap
+// pemanggilan, sehingga dapat menguji perilaku lintas-refresh.
+type scriptedLister struct {
+	lists [][]adbx.Device
+	calls int
+	err   error
+}
+
+func (s *scriptedLister) Devices(ctx context.Context) ([]adbx.Device, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if len(s.lists) == 0 {
+		return nil, nil
+	}
+	if s.calls >= len(s.lists) {
+		return s.lists[len(s.lists)-1], nil
+	}
+	list := s.lists[s.calls]
+	s.calls++
+	return list, nil
 }
 
 func TestStatusReadyWhenOneAuthorized(t *testing.T) {
@@ -1624,13 +2827,27 @@ func TestStatusReadyWhenOneAuthorized(t *testing.T) {
 	}
 }
 
-func TestStatusUnauthorizedTakesPriority(t *testing.T) {
+func TestStatusUnauthorizedWhenNoReadyDevice(t *testing.T) {
 	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "unauthorized"}}})
 	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if m.Current().State != StateUnauthorized {
 		t.Fatalf("got %v, want unauthorized", m.Current().State)
+	}
+}
+
+func TestStatusReadyTakesPriorityOverUnauthorized(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{
+		{Serial: "S1", State: "unauthorized"},
+		{Serial: "S2", State: "device"},
+	}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Current()
+	if got.State != StateReady || got.Serial != "S2" {
+		t.Fatalf("got %v/%q, want ready/S2", got.State, got.Serial)
 	}
 }
 
@@ -1655,22 +2872,254 @@ func TestStatusOfflineWhenOnlyOffline(t *testing.T) {
 }
 
 func TestRepeatedRefreshKeepsSameSerial(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		// Urutan dibalik: S1 harus tetap terpilih (lengket, bukan first-wins).
+		{{Serial: "S2", State: "device"}, {Serial: "S1", State: "device"}},
+		// S1 dicabut: sekarang S2 yang dipakai.
+		{{Serial: "S2", State: "device"}},
+	}}
+	m := New(l)
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 1: got %q, want S1", got)
+	}
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 2 (urutan dibalik): got %q, want tetap S1", got)
+	}
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S2" {
+		t.Fatalf("refresh 3 (S1 dicabut): got %q, want S2", got)
+	}
+}
+
+func TestRefreshMovesAwayWhenPreferredOffline(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		// S1 masih terdaftar tetapi offline; cabang mengingat mensyaratkan
+		// state == "device", jadi pilihan harus pindah ke S2.
+		{{Serial: "S1", State: "offline"}, {Serial: "S2", State: "device"}},
+	}}
+	m := New(l)
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 1: got %q, want S1", got)
+	}
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Current()
+	if got.Serial != "S2" || got.State != StateReady {
+		t.Fatalf("refresh 2: got %q/%v, want S2/ready", got.Serial, got.State)
+	}
+}
+
+func TestModelFallsBackToProduct(t *testing.T) {
 	m := New(fakeLister{devices: []adbx.Device{
-		{Serial: "S1", State: "device"},
-		{Serial: "S2", State: "device"},
+		{Serial: "S1", State: "device", Product: "PixelProduct"},
 	}})
 	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	first := m.Current().Serial
+	if got := m.Current().Model; got != "PixelProduct" {
+		t.Fatalf("Model = %q, want PixelProduct", got)
+	}
+}
+
+func TestOthersListsOtherSerials(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{
+		{Serial: "S1", State: "device"},
+		{Serial: "S2", State: "offline"},
+		{Serial: "S3", State: "unauthorized"},
+	}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	others := m.Current().Others
+	if len(others) != 2 || others[0] != "S2" || others[1] != "S3" {
+		t.Fatalf("Others = %v, want [S2 S3]", others)
+	}
+}
+
+func TestOthersEmptyForSingleDevice(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Others; len(got) != 0 {
+		t.Fatalf("Others = %v, want kosong", got)
+	}
+}
+
+func TestSelectPinsChosenDevice(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+	}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 1: got %q, mau S1", got)
+	}
+	if err := m.Select("S2"); err != nil {
+		t.Fatalf("Select gagal: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S2" {
+		t.Fatalf("setelah pilih: got %q, mau S2", got)
+	}
+}
+
+func TestSelectClearedWhenDeviceDisappears(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		// S2 dicabut: pin harus dilepas dan pilihan jatuh ke S1.
+		{{Serial: "S1", State: "device"}},
+	}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Select("S2"); err != nil {
+		t.Fatalf("Select gagal: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("got %q, mau S1", got)
+	}
+	// Pin sudah dilepas, jadi serial lama sekarang tidak dikenal.
+	if err := m.Select("S2"); err == nil {
+		t.Fatal("Select S2 seharusnya error setelah pin dilepas")
+	}
+}
+
+func TestSelectUnknownSerialErrors(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
+	if err := m.Select("hantu"); err == nil {
+		t.Fatal("Select serial tak dikenal seharusnya error")
+	}
+}
+
+func TestRefreshErrorLeavesCurrentUnchanged(t *testing.T) {
+	l := &fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	l.err = errors.New("adb gagal")
+	if err := m.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh: ingin error, dapat nil")
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("Current().Serial = %q, want tetap S1", got)
+	}
+}
+
+func TestVersionGetterCalledOncePerSerial(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			if serial != "S1" {
+				t.Fatalf("serial = %q, mau S1", serial)
+			}
+			return "13", nil
+		}),
+	)
 	for i := 0; i < 3; i++ {
 		if err := m.Refresh(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if m.Current().Serial != first {
-		t.Fatalf("serial berubah dari %q ke %q padahal masih tersambung",
-			first, m.Current().Serial)
+	if calls != 1 {
+		t.Fatalf("getter dipanggil %d kali, mau 1", calls)
+	}
+	if got := m.Current().AndroidVersion; got != "13" {
+		t.Fatalf("AndroidVersion = %q, mau 13", got)
+	}
+}
+
+func TestVersionGetterErrorIsTolerated(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			return "", errors.New("getprop gagal")
+		}),
+	)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh kedua: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("getter dipanggil %d kali, mau 1", calls)
+	}
+	got := m.Current()
+	if got.AndroidVersion != "" {
+		t.Fatalf("AndroidVersion = %q, mau kosong", got.AndroidVersion)
+	}
+	if got.State != StateReady {
+		t.Fatalf("State = %v, mau ready", got.State)
+	}
+}
+
+func TestVersionGetterNotCalledWhenNotReady(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "unauthorized"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			return "13", nil
+		}),
+	)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("getter dipanggil %d kali, mau 0", calls)
+	}
+}
+
+func TestLoopZeroIntervalDoesNotPanic(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // batalkan segera; Loop cukup tidak boleh panik.
+
+	done := make(chan struct{})
+	go func() {
+		m.Loop(ctx, 0)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop tidak berhenti setelah ctx dibatalkan")
 	}
 }
 ```
@@ -1691,6 +3140,8 @@ package device
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -1708,26 +3159,55 @@ const (
 
 // Status adalah kondisi perangkat aktif saat ini.
 type Status struct {
-	State State     `json:"state"`
-	Serial string   `json:"serial"`
-	Model  string   `json:"model"`
-	Others []string `json:"others,omitempty"`
+	State          State    `json:"state"`
+	Serial         string   `json:"serial"`
+	Model          string   `json:"model"`
+	AndroidVersion string   `json:"androidVersion"`
+	Others         []string `json:"others,omitempty"`
 }
 
 type lister interface {
 	Devices(ctx context.Context) ([]adbx.Device, error)
 }
 
+// VersionGetter mengambil versi Android (mis. dari getprop) untuk satu serial.
+type VersionGetter func(ctx context.Context, serial string) (string, error)
+
+// Option mengubah perilaku Monitor.
+type Option func(*Monitor)
+
+// WithVersionGetter memasang pengambil versi Android. Getter dipanggil sekali
+// per serial (hasilnya di-cache); kegagalan diabaikan dan versi dibiarkan
+// kosong supaya pemantauan tidak pernah terhenti karenanya. Getter nil diabaikan.
+func WithVersionGetter(g VersionGetter) Option {
+	return func(m *Monitor) {
+		if g != nil {
+			m.versionGetter = g
+		}
+	}
+}
+
 // Monitor memilih satu perangkat aktif dan mengingat pilihannya selama
 // perangkat itu masih tersambung.
 type Monitor struct {
-	lister  lister
-	mu      sync.RWMutex
-	current Status
+	lister        lister
+	versionGetter VersionGetter
+	mu            sync.RWMutex
+	current       Status
+	selected      string
+	versions      map[string]string
 }
 
-func New(l lister) *Monitor {
-	return &Monitor{lister: l, current: Status{State: StateNone}}
+func New(l lister, opts ...Option) *Monitor {
+	m := &Monitor{
+		lister:   l,
+		current:  Status{State: StateNone},
+		versions: map[string]string{},
+	}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
 }
 
 // Refresh meminta daftar perangkat terbaru dan memperbarui status.
@@ -1737,9 +3217,76 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 		return err
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.current = pick(devices, m.current.Serial)
+	preferred := m.current.Serial
+	if m.selected != "" {
+		if isReadySerial(devices, m.selected) {
+			preferred = m.selected
+		} else {
+			// Pin mengarah ke perangkat yang sudah hilang atau tidak siap:
+			// lepaskan supaya pilihan kembali lengket ke perangkat aktif.
+			m.selected = ""
+		}
+	}
+	st := pick(devices, preferred)
+	m.current = st
+	var fetchSerial string
+	needFetch := false
+	if st.State == StateReady {
+		if v, ok := m.versions[st.Serial]; ok {
+			m.current.AndroidVersion = v
+		} else {
+			fetchSerial = st.Serial
+			needFetch = true
+		}
+	}
+	m.mu.Unlock()
+
+	if needFetch && m.versionGetter != nil {
+		version, verr := m.versionGetter(ctx, fetchSerial)
+		if verr != nil {
+			version = ""
+		}
+		m.mu.Lock()
+		m.versions[fetchSerial] = version
+		if m.current.Serial == fetchSerial {
+			m.current.AndroidVersion = version
+		}
+		m.mu.Unlock()
+	}
 	return nil
+}
+
+// isReadySerial melaporkan apakah serial ada di daftar dan berstatus "device".
+func isReadySerial(devices []adbx.Device, serial string) bool {
+	for _, d := range devices {
+		if d.Serial == serial && d.State == "device" {
+			return true
+		}
+	}
+	return false
+}
+
+// Select memilih perangkat aktif secara eksplisit. Serial harus dikenal pada
+// status terakhir (perangkat aktif atau salah satu pada Others); selain itu
+// dikembalikan error. Pin dihormati oleh Refresh selama perangkat itu hadir dan
+// siap, lalu dilepas otomatis bila menghilang.
+func (m *Monitor) Select(serial string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if serial == "" {
+		return errors.New("serial kosong")
+	}
+	if serial == m.current.Serial {
+		m.selected = serial
+		return nil
+	}
+	for _, s := range m.current.Others {
+		if s == serial {
+			m.selected = serial
+			return nil
+		}
+	}
+	return fmt.Errorf("perangkat %s tidak dikenal", serial)
 }
 
 func pick(devices []adbx.Device, preferred string) Status {
@@ -1797,9 +3344,21 @@ func (m *Monitor) Current() Status {
 	return m.current
 }
 
+// defaultLoopInterval dipakai bila Loop diberikan interval tidak positif,
+// sebab time.NewTicker panik untuk durasi <= 0.
+const defaultLoopInterval = 2 * time.Second
+
+// loopInterval mengembalikan interval yang aman untuk time.NewTicker.
+func loopInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultLoopInterval
+	}
+	return interval
+}
+
 // Loop memantau perangkat secara berkala sampai ctx dibatalkan.
 func (m *Monitor) Loop(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(loopInterval(interval))
 	defer ticker.Stop()
 	for {
 		_ = m.Refresh(ctx)
@@ -1815,7 +3374,7 @@ func (m *Monitor) Loop(ctx context.Context, interval time.Duration) {
 - [ ] **Step 4: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/device/ -v`
-Expected: PASS untuk kelima tes.
+Expected: PASS untuk seluruh tes device.
 
 - [ ] **Step 5: Commit**
 
@@ -1841,14 +3400,64 @@ Create `internal/apkmeta/apkmeta_test.go`:
 package apkmeta
 
 import (
+	"archive/zip"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// fixtureAPK membangun APK minimal: arsip zip berisi AndroidManifest.xml
-// biner. Berkas dibuat sekali di TestMain agar tidak perlu biner besar
-// di dalam repo.
+// moduleManifestBin adalah AndroidManifest.xml biner bawaan modul apkparser.
+// Berkas ini tidak disalin ke repo; tes membangun APK sementara saat berjalan.
+const moduleManifestBin = "98d2e837b8f3ac41e74b86b2d532972955e5352197a893206ecd9650f678ae31.bin"
+
+// buildModuleAPK membangun berkas APK sementara dari testdata biner modul
+// apkparser. Tes di-skip bila modul atau testdata-nya tidak tersedia.
+func buildModuleAPK(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/avast/apkparser").Output()
+	if err != nil {
+		t.Skipf("modul apkparser tidak tersedia: %v", err)
+	}
+	binPath := filepath.Join(strings.TrimSpace(string(out)), "testdata", moduleManifestBin)
+	data, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Skipf("testdata modul apkparser tidak tersedia: %v", err)
+	}
+
+	apkPath := filepath.Join(t.TempDir(), "mini.apk")
+	f, err := os.Create(apkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("AndroidManifest.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return apkPath
+}
+
+func resetCache() {
+	cacheMu.Lock()
+	cache = map[string]cachedMeta{}
+	cacheMu.Unlock()
+}
+
+// TestReadFixture membaca fixture testdata/mini.apk bila tersedia dan
+// memeriksa package beserta versionName-nya. Tes di-skip bila fixture belum
+// disediakan.
 func TestReadFixture(t *testing.T) {
 	path := filepath.Join("testdata", "mini.apk")
 	if _, err := os.Stat(path); err != nil {
@@ -1873,6 +3482,79 @@ func TestReadRejectsNonAPK(t *testing.T) {
 	}
 	if _, err := Read(path); err == nil {
 		t.Fatal("seharusnya error untuk berkas bukan APK")
+	}
+}
+
+// TestReadRealManifestFromModule menjalankan jalur parse APK sungguhan di CI
+// tanpa mengomit APK milik siapa pun: APK dibangun saat tes dari manifest
+// biner bawaan modul apkparser.
+func TestReadRealManifestFromModule(t *testing.T) {
+	apk := buildModuleAPK(t)
+	got, err := Read(apk)
+	if err != nil {
+		t.Fatalf("Read APK asli gagal: %v", err)
+	}
+	if got.Package != "name.tbx.erndy" {
+		t.Fatalf("package salah: %q", got.Package)
+	}
+	if got.VersionName != "1.3" {
+		t.Fatalf("versionName salah: %q", got.VersionName)
+	}
+	if got.VersionCode != 4 {
+		t.Fatalf("versionCode salah: %d", got.VersionCode)
+	}
+	if got.MinSDK != 4 {
+		t.Fatalf("minSdk salah: %d", got.MinSDK)
+	}
+}
+
+// TestReadCachedStaleness memastikan cache tidak dipakai saat size/mtime
+// berubah: pemanggilan kedua harus membaca ulang, sehingga berkas yang bukan
+// APK memunculkan error alih-alih mengembalikan entri basi.
+func TestReadCachedStaleness(t *testing.T) {
+	t.Cleanup(resetCache)
+	path := filepath.Join(t.TempDir(), "hilang.apk")
+
+	// Isi cache secara putih untuk path ini, meniru hasil baca sebelumnya.
+	cacheMu.Lock()
+	cache[path] = cachedMeta{size: 1, mod: 1, meta: Meta{Package: "basi"}}
+	cacheMu.Unlock()
+
+	got, err := ReadCached(path, 2, 2)
+	if err == nil {
+		t.Fatalf("stat berubah seharusnya memicu baca ulang: %+v", got)
+	}
+}
+
+// TestReadCachedBounds memastikan cache tetap terbatas saat terus diisi.
+func TestReadCachedBounds(t *testing.T) {
+	t.Cleanup(resetCache)
+	apk := buildModuleAPK(t)
+
+	cacheMu.Lock()
+	for i := 0; i < cacheMaxEntries; i++ {
+		cache[fmt.Sprintf("/dummy/%d.apk", i)] = cachedMeta{size: 1, mod: 1}
+	}
+	cacheMu.Unlock()
+
+	m, err := ReadCached(apk, 10, 20)
+	if err != nil {
+		t.Fatalf("ReadCached gagal: %v", err)
+	}
+	cacheMu.Lock()
+	size := len(cache)
+	cacheMu.Unlock()
+	if size > cacheMaxEntries {
+		t.Fatalf("cache melebihi batas: %d > %d", size, cacheMaxEntries)
+	}
+
+	// Lookup ulang untuk stat yang sama harus tetap bekerja.
+	got, err := ReadCached(apk, 10, 20)
+	if err != nil {
+		t.Fatalf("ReadCached ulang gagal: %v", err)
+	}
+	if got != m {
+		t.Fatalf("hasil cache tidak konsisten: %+v vs %+v", got, m)
 	}
 }
 ```
@@ -1981,6 +3663,10 @@ var (
 	cache   = map[string]cachedMeta{}
 )
 
+// cacheMaxEntries membatasi jumlah entri cache agar tidak tumbuh tanpa batas
+// saat daftar APK terus berubah.
+const cacheMaxEntries = 512
+
 type cachedMeta struct {
 	size int64
 	mod  int64
@@ -2003,6 +3689,9 @@ func ReadCached(path string, size, modUnixNano int64) (Meta, error) {
 	}
 
 	cacheMu.Lock()
+	if len(cache) >= cacheMaxEntries {
+		cache = map[string]cachedMeta{}
+	}
 	cache[path] = cachedMeta{size: size, mod: modUnixNano, meta: m}
 	cacheMu.Unlock()
 	return m, nil
@@ -2054,6 +3743,9 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -2210,6 +3902,292 @@ func TestLoadConfigMissingFileReturnsDefault(t *testing.T) {
 		t.Fatalf("default harus kosong: %+v", cfg)
 	}
 }
+
+func TestLoadConfigCorruptReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{ini bukan json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("config.json rusak seharusnya mengembalikan error")
+	}
+}
+
+func TestSaveConfigReplacesAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := SaveConfig(path, Config{ApkFolder: "/lama"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfig(path, Config{ApkFolder: "/baru"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ApkFolder != "/baru" {
+		t.Fatalf("nilai baru tidak menimpa: %+v", got)
+	}
+	// Tidak boleh ada berkas sementara yang tertinggal.
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), "config.json.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("berkas sementara tertinggal: %v", matches)
+	}
+}
+
+func TestAppendDefaultsZeroTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	before := time.Now()
+	if err := s.Append(Entry{Package: "pkg"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("harus 1 entri, dapat %d", len(got))
+	}
+	if got[0].Time.IsZero() {
+		t.Fatal("Time nol seharusnya diisi waktu sekarang")
+	}
+	if got[0].Time.Before(before.Add(-time.Second)) || got[0].Time.After(time.Now().Add(time.Second)) {
+		t.Fatalf("Time tidak wajar: %v (sekarang %v)", got[0].Time, time.Now())
+	}
+}
+
+func TestExportJSONEmptyIsArray(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	var buf bytes.Buffer
+	if err := s.ExportJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(buf.String()) != "[]" {
+		t.Fatalf("ekspor kosong harus [] bukan null: %q", buf.String())
+	}
+}
+
+func TestReadMissingFileReturnsNil(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "tidak-ada.jsonl"))
+	got, err := s.Read(5)
+	if err != nil {
+		t.Fatalf("berkas hilang seharusnya tidak error: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("berkas hilang harus nil: %+v", got)
+	}
+}
+
+func TestReadTailEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New(path).Read(5)
+	if err != nil {
+		t.Fatalf("berkas kosong tidak boleh error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("berkas kosong harus kosong: %+v", got)
+	}
+}
+
+func TestReadTailLimitOnSmallFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	base := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		if err := s.Append(Entry{
+			Time:    base.Add(time.Duration(i) * time.Minute),
+			Package: fmt.Sprintf("pkg-%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		limit int
+		want  []string
+	}{
+		{1, []string{"pkg-4"}},
+		{2, []string{"pkg-4", "pkg-3"}},
+		{5, []string{"pkg-4", "pkg-3", "pkg-2", "pkg-1", "pkg-0"}},
+		{9, []string{"pkg-4", "pkg-3", "pkg-2", "pkg-1", "pkg-0"}},
+	}
+	for _, tc := range cases {
+		got, err := s.Read(tc.limit)
+		if err != nil {
+			t.Fatalf("Read(%d) gagal: %v", tc.limit, err)
+		}
+		if len(got) != len(tc.want) {
+			t.Fatalf("Read(%d) dapat %d entri, mau %d: %+v", tc.limit, len(got), len(tc.want), got)
+		}
+		for i := range tc.want {
+			if got[i].Package != tc.want[i] {
+				t.Fatalf("Read(%d) urutan salah di %d: got %q mau %q", tc.limit, i, got[i].Package, tc.want[i])
+			}
+		}
+	}
+}
+
+func TestReadTailLastThreeOfLargeHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 2000; i++ {
+		if err := s.Append(Entry{Package: fmt.Sprintf("pkg-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Read(3)
+	if err != nil {
+		t.Fatalf("Read gagal: %v", err)
+	}
+	want := []string{"pkg-1999", "pkg-1998", "pkg-1997"}
+	if len(got) != len(want) {
+		t.Fatalf("harus 3 entri, dapat %d: %+v", len(got), got)
+	}
+	for i := range want {
+		if got[i].Package != want[i] {
+			t.Fatalf("urutan salah di %d: got %q mau %q", i, got[i].Package, want[i])
+		}
+	}
+}
+
+func TestReadTailNoTrailingNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	e1, err := json.Marshal(Entry{Package: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := json.Marshal(Entry{Package: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Baris terakhir sengaja tanpa newline penutup.
+	if err := appendRaw(path, string(e1)+"\n"+string(e2)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Package != "b" {
+		t.Fatalf("baris terakhir tanpa newline salah: %+v", got)
+	}
+}
+
+func TestReadTailLineLongerThanChunk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	big := strings.Repeat("x", 200*1024)
+	if err := s.Append(Entry{Package: "big", Detail: big}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(Entry{Package: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Package != "small" {
+		t.Fatalf("entri terakhir salah: %+v", got)
+	}
+	got, err = s.Read(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Package != "big" || got[1].Detail != big {
+		t.Fatalf("baris panjang tidak terbaca utuh: len=%d", len(got))
+	}
+}
+
+func TestReadTailRefillsPastCorruptLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 200; i++ {
+		if err := s.Append(Entry{Package: fmt.Sprintf("pkg-%03d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Baris rusak di paling ekor tidak boleh membuat Read(limit) kekurangan
+	// entri: pembacaan harus mundur sampai limit entri sah terkumpul.
+	if err := appendRaw(path, "{ini bukan json}\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pkg-199", "pkg-198", "pkg-197", "pkg-196", "pkg-195"}
+	if len(got) != len(want) {
+		t.Fatalf("harus %d entri sah, dapat %d: %+v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i].Package != want[i] {
+			t.Fatalf("urutan salah di %d: got %q mau %q", i, got[i].Package, want[i])
+		}
+	}
+}
+
+func TestReadHugeLimitNoOverflow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 3; i++ {
+		if err := s.Append(Entry{Package: fmt.Sprintf("pkg-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// limit == math.MaxInt tidak boleh meluap atau panik; artinya baca semua.
+	got, err := s.Read(math.MaxInt)
+	if err != nil {
+		t.Fatalf("Read(math.MaxInt) gagal: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("harus 3 entri, dapat %d: %+v", len(got), got)
+	}
+	if got[0].Package != "pkg-2" {
+		t.Fatalf("terbaru harus pkg-2, dapat %q", got[0].Package)
+	}
+}
+
+func TestReadFullHandlesLongDetailAndExport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	// ~2 MB, jauh di atas buffer scanner lama (1 MB) tetapi di bawah batas
+	// baru (8 MB).
+	big := strings.Repeat("d", 2*1024*1024)
+	if err := s.Append(Entry{Package: "big", Detail: big, Success: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(0)
+	if err != nil {
+		t.Fatalf("Read(0) gagal untuk Detail panjang: %v", err)
+	}
+	if len(got) != 1 || got[0].Detail != big {
+		t.Fatalf("Detail panjang tidak bulat: len=%d", len(got))
+	}
+
+	var csvBuf bytes.Buffer
+	if err := s.ExportCSV(&csvBuf); err != nil {
+		t.Fatalf("ExportCSV gagal: %v", err)
+	}
+	if !strings.Contains(csvBuf.String(), big) {
+		t.Fatal("CSV tidak memuat Detail panjang")
+	}
+	var jsonBuf bytes.Buffer
+	if err := s.ExportJSON(&jsonBuf); err != nil {
+		t.Fatalf("ExportJSON gagal: %v", err)
+	}
+	if !strings.Contains(jsonBuf.String(), big) {
+		t.Fatal("JSON tidak memuat Detail panjang")
+	}
+}
 ```
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
@@ -2227,15 +4205,20 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 )
+
+// newline adalah pemisah satu entri JSON Lines.
+var newline = []byte{'\n'}
 
 // Entry adalah satu baris riwayat audit.
 type Entry struct {
@@ -2281,6 +4264,10 @@ func (s *Store) Append(e Entry) error {
 }
 
 // Read mengembalikan paling banyak limit entri, terbaru lebih dulu.
+//
+// Bila limit > 0, hanya ekor berkas yang dibaca sehingga biaya baca tidak
+// bergantung pada panjang riwayat. Limit <= 0 membaca seluruh berkas, dipakai
+// oleh ekspor CSV/JSON.
 func (s *Store) Read(limit int) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2294,9 +4281,13 @@ func (s *Store) Read(limit int) ([]Entry, error) {
 	}
 	defer f.Close()
 
+	if limit > 0 {
+		return readTail(f, limit)
+	}
+
 	var all []Entry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -2316,10 +4307,108 @@ func (s *Store) Read(limit int) ([]Entry, error) {
 	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
 		all[i], all[j] = all[j], all[i]
 	}
-	if limit > 0 && len(all) > limit {
-		all = all[:limit]
-	}
 	return all, nil
+}
+
+// tailChunkSize adalah ukuran tiap potongan saat membaca mundur dari ekor.
+const tailChunkSize = 64 * 1024
+
+// maxLineSize adalah batas panjang satu baris pada jalur baca penuh. Nilai ini
+// cukup besar untuk menampung Detail yang panjang (mis. dump adb) tanpa
+// menggagalkan pemindaian.
+const maxLineSize = 8 * 1024 * 1024
+
+// readTail mengembalikan paling banyak limit entri terakhir berkas, terbaru
+// lebih dulu. Baris yang lebih panjang dari tailChunkSize tetap utuh karena
+// potongan terus dibaca sampai baris lengkap terkumpul. Pembacaan mundur
+// berlanjut melewati baris rusak sampai terkumpul limit entri yang benar-benar
+// dapat di-parse, atau sampai awal berkas.
+func readTail(f *os.File, limit int) ([]Entry, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	if size == 0 {
+		return nil, nil
+	}
+
+	// Kumpulkan potongan dari ekor sampai cukup banyak entri sah. Jumlah
+	// baris baru dipakai sebagai batas atas murah: selama newline belum
+	// mencapai limit, mustahil ada limit entri sah, jadi tidak perlu parse.
+	// Batas ini juga aman untuk limit == math.MaxInt karena tidak pernah
+	// dihitung limit+1 yang bisa meluap.
+	var buf []byte
+	var newlines int64
+	pos := size
+	for pos > 0 {
+		n := int64(tailChunkSize)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		chunk := make([]byte, n)
+		if _, err := f.ReadAt(chunk, pos); err != nil {
+			return nil, err
+		}
+		// chunk mendahului buf karena dibaca lebih dekat ke awal berkas.
+		buf = append(chunk, buf...)
+		newlines += int64(bytes.Count(chunk, newline))
+		if newlines < int64(limit) {
+			continue
+		}
+		if countParsedLines(buf, pos > 0) >= limit {
+			break
+		}
+	}
+
+	lines := bytes.Split(buf, newline)
+	// Buang segmen kosong setelah newline terakhir, bila ada.
+	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
+		lines = lines[:len(lines)-1]
+	}
+	// Bila pembacaan berhenti sebelum awal berkas, segmen pertama bisa
+	// dimulai di tengah baris; buang agar sisa segmen pasti utuh.
+	if pos > 0 && len(lines) > 0 {
+		lines = lines[1:]
+	}
+
+	// Telusuri dari ekor agar entri terbaru lebih dulu, melewati baris rusak,
+	// sampai limit entri terkumpul.
+	var entries []Entry
+	for i := len(lines) - 1; i >= 0 && len(entries) < limit; i-- {
+		line := lines[i]
+		if len(line) == 0 {
+			continue
+		}
+		var e Entry
+		if err := json.Unmarshal(line, &e); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+// countParsedLines menghitung baris pada buf yang berhasil di-parse. Bila
+// skipFirst benar, segmen pertama diabaikan karena potongan pembacaan bisa
+// dimulai di tengah baris sehingga segmen itu tidak utuh.
+func countParsedLines(buf []byte, skipFirst bool) int {
+	lines := bytes.Split(buf, newline)
+	if skipFirst && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	n := 0
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		var e Entry
+		if json.Unmarshal(line, &e) == nil {
+			n++
+		}
+	}
+	return n
 }
 
 // ExportCSV menulis seluruh riwayat sebagai CSV.
@@ -2394,13 +4483,41 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// SaveConfig menulis konfigurasi ke disk.
+// SaveConfig menulis konfigurasi ke disk secara atomik: tulis ke berkas
+// sementara di direktori yang sama, sync, lalu rename menimpa target. Dengan
+// begitu crash atau disk penuh tidak meninggalkan config.json yang rusak.
 func SaveConfig(path string, cfg Config) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
+	data = append(data, '\n')
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("membuat berkas sementara untuk %s: %w", path, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menulis %s: %w", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyinkronkan %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("menutup berkas sementara %s: %w", tmpName, err)
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return fmt.Errorf("mengatur mode %s: %w", path, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("memindahkan %s ke %s: %w", tmpName, path, err)
+	}
+	return nil
 }
 ```
 
@@ -2454,10 +4571,12 @@ Create `internal/queue/queue_test.go`:
 package queue
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2465,10 +4584,11 @@ import (
 )
 
 type fakeRunner struct {
-	mu    sync.Mutex
-	calls []string
-	fail  map[string]error
-	block chan struct{}
+	mu          sync.Mutex
+	calls       []string
+	fail        map[string]error
+	block       chan struct{}
+	interrupted chan struct{}
 }
 
 func newFakeRunner() *fakeRunner {
@@ -2497,6 +4617,9 @@ func (f *fakeRunner) Install(ctx context.Context, apkPath string, opts adbx.Inst
 		select {
 		case <-f.block:
 		case <-ctx.Done():
+			if f.interrupted != nil {
+				close(f.interrupted)
+			}
 			return ctx.Err()
 		}
 	}
@@ -2530,6 +4653,20 @@ func (f *fakeRunner) PullApk(ctx context.Context, pkg string, destDir string) (s
 		return "", err
 	}
 	return destDir + "/" + pkg + ".apk", nil
+}
+
+// slowSuccessRunner meniru runner yang tetap mengembalikan sukses meski
+// konteksnya dibatalkan, untuk menguji cabang finalisasi cancelled.
+type slowSuccessRunner struct {
+	fakeRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *slowSuccessRunner) Install(ctx context.Context, apkPath string, opts adbx.InstallOptions, stage adbx.StageFunc) error {
+	close(r.started)
+	<-r.release
+	return nil
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -2636,8 +4773,8 @@ func TestCancelQueuedJobPreventsRun(t *testing.T) {
 
 func TestWaitsWhileDeviceDisconnected(t *testing.T) {
 	fr := newFakeRunner()
-	var connected bool
-	q := New(fr, WithDeviceCheck(func() bool { return connected }))
+	var connected atomic.Bool
+	q := New(fr, WithDeviceCheck(func() bool { return connected.Load() }))
 	runQueue(t, q)
 
 	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
@@ -2646,7 +4783,7 @@ func TestWaitsWhileDeviceDisconnected(t *testing.T) {
 		t.Fatalf("tanpa perangkat job harus tetap queued, dapat %v", got)
 	}
 
-	connected = true
+	connected.Store(true)
 	waitFor(t, "job jalan setelah perangkat tersambung", func() bool {
 		return statusOf(t, q, a.ID).Status == StatusSuccess
 	})
@@ -2706,8 +4843,206 @@ func TestUnknownKindFails(t *testing.T) {
 	waitFor(t, "job gagal", func() bool {
 		return statusOf(t, q, a.ID).Status == StatusFailed
 	})
-	if !errors.Is(errors.New(statusOf(t, q, a.ID).Error), errors.New(statusOf(t, q, a.ID).Error)) {
-		t.Fatal("tidak mungkin terjadi")
+	if statusOf(t, q, a.ID).Error == "" {
+		t.Fatal("job dengan jenis tak dikenal harus punya pesan error")
+	}
+}
+
+func TestRunReturnsOnContextCancel(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		q.Run(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run tidak kembali setelah konteks dibatalkan")
+	}
+}
+
+func TestSubscribeDeliversAndUnsubscribeIsIdempotent(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+
+	ch, unsubscribe := q.Subscribe()
+	q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/sub.apk"})
+
+	select {
+	case _, ok := <-ch:
+		if !ok {
+			t.Fatal("saluran langganan ditutup sebelum mengirim pembaruan")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("tidak menerima pembaruan langganan")
+	}
+
+	// Panggilan kedua harus idempoten dan tidak boleh panik.
+	unsubscribe()
+	unsubscribe()
+
+	// Setelah unsubscribe, saluran ditutup sehingga tidak ada pengiriman baru.
+	closed := false
+	for !closed {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				closed = true
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("saluran langganan tidak ditutup setelah unsubscribe")
+		}
+	}
+
+	// Pelanggan lambat: saluran penuh tidak boleh menghambat Enqueue.
+	slow := New(newFakeRunner())
+	slowCh, slowUnsub := slow.Subscribe()
+	defer slowUnsub()
+
+	doneEnqueue := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			slow.Enqueue(Job{Kind: KindInstall, Target: "/tmp/slow.apk"})
+		}
+		close(doneEnqueue)
+	}()
+
+	select {
+	case <-doneEnqueue:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Enqueue terhambat oleh pelanggan dengan saluran penuh")
+	}
+	if len(slowCh) != cap(slowCh) {
+		t.Fatalf("saluran pelanggan lambat seharusnya penuh: len=%d cap=%d", len(slowCh), cap(slowCh))
+	}
+}
+
+func TestRunJobSkipsNonQueuedJob(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	job := &Job{ID: "selesai", Kind: KindInstall, Target: "/tmp/selesai.apk", Status: StatusCancelled}
+
+	q.runJob(context.Background(), job)
+
+	if got := job.Status; got != StatusCancelled {
+		t.Fatalf("job non-queued harus tetap cancelled, dapat %v", got)
+	}
+	if got := fr.sequence(); len(got) != 0 {
+		t.Fatalf("runner tidak boleh dipanggil untuk job non-queued, dapat %v", got)
+	}
+}
+
+func TestCancelledJobStaysCancelledWhenRunnerSucceeds(t *testing.T) {
+	fr := &slowSuccessRunner{started: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan Job, 1)
+	q := New(fr, WithOnDone(func(j Job, err error) { done <- j }))
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	select {
+	case <-fr.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner tidak mulai")
+	}
+	if err := q.Cancel(a.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+	close(fr.release)
+
+	select {
+	case final := <-done:
+		if final.Status != StatusCancelled {
+			t.Fatalf("status akhir harus cancelled, dapat %v", final.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("job tidak selesai setelah runner dilepas")
+	}
+}
+
+func TestCancelRunningInterruptsRunner(t *testing.T) {
+	fr := newFakeRunner()
+	fr.block = make(chan struct{})
+	fr.interrupted = make(chan struct{})
+	q := New(fr)
+	runQueue(t, q)
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/a.apk"})
+	waitFor(t, "job berjalan", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusRunning
+	})
+	if err := q.Cancel(a.ID); err != nil {
+		t.Fatalf("Cancel gagal: %v", err)
+	}
+
+	select {
+	case <-fr.interrupted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner tidak menerima sinyal pembatalan")
+	}
+	waitFor(t, "job akhir cancelled", func() bool {
+		return statusOf(t, q, a.ID).Status == StatusCancelled
+	})
+}
+
+func TestSubscriberSeesLifecycle(t *testing.T) {
+	fr := newFakeRunner()
+	q := New(fr)
+	runQueue(t, q)
+
+	ch, unsubscribe := q.Subscribe()
+	defer unsubscribe()
+
+	a := q.Enqueue(Job{Kind: KindInstall, Target: "/tmp/life.apk"})
+
+	sawRunning := false
+	sawTerminal := false
+	deadline := time.After(3 * time.Second)
+	for !sawRunning || !sawTerminal {
+		select {
+		case j, ok := <-ch:
+			if !ok {
+				t.Fatal("saluran langganan ditutup sebelum siklus penuh")
+			}
+			if j.ID != a.ID {
+				continue
+			}
+			switch j.Status {
+			case StatusRunning:
+				sawRunning = true
+			case StatusSuccess, StatusFailed, StatusCancelled:
+				sawTerminal = true
+			}
+		case <-deadline:
+			t.Fatalf("siklus tidak lengkap: running=%v terminal=%v", sawRunning, sawTerminal)
+		}
+	}
+}
+
+func TestJobJSONOmitsUnsetTimestamps(t *testing.T) {
+	queued, err := json.Marshal(Job{ID: "x", Kind: KindInstall, Status: StatusQueued})
+	if err != nil {
+		t.Fatalf("marshal job queued: %v", err)
+	}
+	if bytes.Contains(queued, []byte("startedAt")) || bytes.Contains(queued, []byte("endedAt")) {
+		t.Fatalf("job queued tidak boleh memuat timestamp: %s", queued)
+	}
+
+	started := time.Now()
+	ended := started.Add(time.Second)
+	done, err := json.Marshal(Job{ID: "x", Kind: KindInstall, Status: StatusSuccess, StartedAt: &started, EndedAt: &ended})
+	if err != nil {
+		t.Fatalf("marshal job selesai: %v", err)
+	}
+	if !bytes.Contains(done, []byte("startedAt")) || !bytes.Contains(done, []byte("endedAt")) {
+		t.Fatalf("job selesai harus memuat timestamp: %s", done)
 	}
 }
 ```
@@ -2757,21 +5092,21 @@ const (
 
 // Job adalah satu pekerjaan di antrean.
 type Job struct {
-	ID             string    `json:"id"`
-	Kind           Kind      `json:"kind"`
-	Target         string    `json:"target"`
-	Label          string    `json:"label,omitempty"`
-	DestDir        string    `json:"destDir,omitempty"`
-	Replace        bool      `json:"replace,omitempty"`
-	AllowDowngrade bool      `json:"allowDowngrade,omitempty"`
-	Status         Status    `json:"status"`
-	Progress       int       `json:"progress"`
-	Message        string    `json:"message,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	Result         string    `json:"result,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	StartedAt      time.Time `json:"startedAt,omitempty"`
-	EndedAt        time.Time `json:"endedAt,omitempty"`
+	ID             string     `json:"id"`
+	Kind           Kind       `json:"kind"`
+	Target         string     `json:"target"`
+	Label          string     `json:"label,omitempty"`
+	DestDir        string     `json:"destDir,omitempty"`
+	Replace        bool       `json:"replace,omitempty"`
+	AllowDowngrade bool       `json:"allowDowngrade,omitempty"`
+	Status         Status     `json:"status"`
+	Progress       int        `json:"progress"`
+	Message        string     `json:"message,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	Result         string     `json:"result,omitempty"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	StartedAt      *time.Time `json:"startedAt,omitempty"`
+	EndedAt        *time.Time `json:"endedAt,omitempty"`
 }
 
 // Runner adalah kemampuan perangkat yang dibutuhkan antrean.
@@ -2875,10 +5210,16 @@ func (q *Queue) Cancel(id string) error {
 	case StatusQueued:
 		job.Status = StatusCancelled
 		job.Message = "dibatalkan sebelum dijalankan"
-		job.EndedAt = time.Now()
+		ended := time.Now()
+		job.EndedAt = &ended
 		snap := *job
 		q.mu.Unlock()
 		q.broadcast(snap)
+		// Setiap aksi harus tercatat di riwayat, termasuk pembatalan saat masih
+		// menunggu. Bentuk argumen disamakan dengan jalur job berjalan.
+		if q.onDone != nil {
+			q.onDone(snap, context.Canceled)
+		}
 		return nil
 	case StatusRunning:
 		cancel := q.cancels[id]
@@ -2973,7 +5314,8 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 		return
 	}
 	job.Status = StatusRunning
-	job.StartedAt = time.Now()
+	started := time.Now()
+	job.StartedAt = &started
 	job.Message = "Mulai"
 	q.cancels[job.ID] = cancel
 	snap := *job
@@ -2985,13 +5327,20 @@ func (q *Queue) runJob(ctx context.Context, job *Job) {
 
 	q.mu.Lock()
 	delete(q.cancels, job.ID)
-	job.EndedAt = time.Now()
+	ended := time.Now()
+	job.EndedAt = &ended
 	switch {
 	case job.Status == StatusCancelled:
 		// sudah ditandai oleh Cancel
 	case err != nil && errors.Is(err, context.Canceled):
 		job.Status = StatusCancelled
 		job.Message = "dibatalkan"
+	case err != nil && errors.Is(err, adbx.ErrDeviceNotFound):
+		// Perangkat dicabut di tengah proses: beri pesan yang lebih jelas, tetapi
+		// error asli tetap disimpan agar bisa ditelusuri.
+		job.Status = StatusFailed
+		job.Message = "perangkat terputus"
+		job.Error = err.Error()
 	case err != nil:
 		job.Status = StatusFailed
 		job.Error = err.Error()
@@ -3063,6 +5412,11 @@ func (q *Queue) setResult(id, result string) {
 }
 ```
 
+**Catatan timestamp:** `StartedAt` dan `EndedAt` kini bertipe `*time.Time`
+agar `omitempty` benar-benar menghilangkan kedua bidang saat job masih antre;
+field diisi lewat pointer baru (`&started`, `&ended`) dan tidak pernah dimutasi
+melalui pointer bersama.
+
 - [ ] **Step 4: Rapikan tes terakhir yang berlebihan**
 
 Tes `TestUnknownKindFails` memuat pemeriksaan `errors.Is` yang tidak berguna.
@@ -3089,7 +5443,7 @@ dari blok import `queue_test.go`.
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/queue/ -race -v`
-Expected: PASS untuk ketujuh tes, tanpa peringatan race.
+Expected: PASS untuk keempat belas tes, tanpa peringatan race.
 
 - [ ] **Step 6: Commit**
 
@@ -3133,10 +5487,39 @@ import (
 	"github.com/herlangga72/adbapp/internal/store"
 )
 
-type fakeDevice struct{ status device.Status }
+type fakeDevice struct {
+	status   device.Status
+	selected string
+}
 
-func (f fakeDevice) Current() device.Status                     { return f.status }
-func (f fakeDevice) Refresh(ctx context.Context) error          { return nil }
+func (f *fakeDevice) Current() device.Status            { return f.status }
+func (f *fakeDevice) Refresh(ctx context.Context) error { return nil }
+
+// Select meniru Monitor.Select: hanya serial yang dikenal yang diterima, lalu
+// perangkat itu dijadikan yang aktif.
+func (f *fakeDevice) Select(serial string) error {
+	all := append([]string{f.status.Serial}, f.status.Others...)
+	found := false
+	for _, s := range all {
+		if s == serial {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("perangkat %s tidak dikenal", serial)
+	}
+	f.selected = serial
+	f.status.Serial = serial
+	others := []string{}
+	for _, s := range all {
+		if s != serial {
+			others = append(others, s)
+		}
+	}
+	f.status.Others = others
+	return nil
+}
 
 type fakeQueue struct{ enqueued []queue.Job }
 
@@ -3146,7 +5529,7 @@ func (f *fakeQueue) Enqueue(j queue.Job) queue.Job {
 	j.Status = queue.StatusQueued
 	return j
 }
-func (f *fakeQueue) Jobs() []queue.Job { return nil }
+func (f *fakeQueue) Jobs() []queue.Job      { return nil }
 func (f *fakeQueue) Cancel(id string) error { return nil }
 func (f *fakeQueue) Subscribe() (<-chan queue.Job, func()) {
 	ch := make(chan queue.Job)
@@ -3177,7 +5560,7 @@ func newTestServer(t *testing.T) (*Server, *fakeQueue) {
 	t.Helper()
 	fq := &fakeQueue{}
 	s := &Server{
-		Device:  fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
+		Device:  &fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
 		Queue:   fq,
 		History: &fakeHistory{entries: []store.Entry{{Action: "install", Package: "com.foo", Success: true}}},
 		Adb:     fakeAdb{},
@@ -3187,10 +5570,18 @@ func newTestServer(t *testing.T) (*Server, *fakeQueue) {
 	return s, fq
 }
 
+// localRequest membuat permintaan dengan Host lokal, karena httptest.NewRequest
+// memakai "example.com" yang memang ditolak oleh middleware localOnly.
+func localRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Host = "127.0.0.1"
+	return req
+}
+
 func TestStateEndpoint(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/state", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d", rec.Code)
 	}
@@ -3205,11 +5596,25 @@ func TestStateEndpoint(t *testing.T) {
 	}
 }
 
+func TestHistoryEmptyReturnsArray(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.History = store.New(filepath.Join(t.TempDir(), "history.jsonl"))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/history", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d", rec.Code)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "[]" {
+		t.Fatalf("body = %q, mau []", body)
+	}
+}
+
 func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 	s, fq := newTestServer(t)
 	payload := `{"kind":"uninstall","targets":["com.a","com.b"]}`
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/jobs", strings.NewReader(payload))
+	req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(payload))
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
@@ -3225,7 +5630,7 @@ func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 func TestCreateJobsRejectsUnknownKind(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"ngawur","targets":["x"]}`))
+	req := localRequest(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"ngawur","targets":["x"]}`))
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("harus 400, dapat %d", rec.Code)
@@ -3235,7 +5640,7 @@ func TestCreateJobsRejectsUnknownKind(t *testing.T) {
 func TestExportCSVSetsHeaders(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/history/export?format=csv", nil))
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/history/export?format=csv", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d", rec.Code)
 	}
@@ -3258,7 +5663,7 @@ func TestLocalOnlyRejectsForeignHost(t *testing.T) {
 	}
 }
 
-func TestUploadSavesFile(t *testing.T) {
+func TestUploadRejectsCorruptAPK(t *testing.T) {
 	s, _ := newTestServer(t)
 	if err := s.Paths.Ensure(); err != nil {
 		t.Fatal(err)
@@ -3267,20 +5672,24 @@ func TestUploadSavesFile(t *testing.T) {
 	var body bytes.Buffer
 	writeMultipart(t, &body, "file", "contoh.apk", []byte("bukan-apk-sungguhan"))
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/apks/upload", &body)
+	req := localRequest(http.MethodPost, "/api/apks/upload", &body)
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=batas")
 	s.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	// Berkas yang bukan APK sah ditolak dan tidak ditinggalkan di folder.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d body %s", rec.Code, rec.Body.String())
 	}
-	var got apkEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("JSON tidak sah: %v", err)
-	}
-	want := filepath.Join(s.Paths.UploadsDir, "contoh.apk")
-	if got.Path != want {
-		t.Fatalf("path salah: got %q want %q", got.Path, want)
+}
+
+func TestSelectDeviceUnknownSerial(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/device/select", strings.NewReader(`{"serial":"tidak-ada"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("harus 404, dapat %d body %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -3296,7 +5705,7 @@ func writeMultipart(t *testing.T, buf *bytes.Buffer, field, filename string, con
 func TestIndexServedFromEmbeddedFS(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("kode %d", rec.Code)
 	}
@@ -3340,6 +5749,7 @@ import (
 type DeviceSource interface {
 	Current() device.Status
 	Refresh(ctx context.Context) error
+	Select(serial string) error
 }
 
 type JobQueue interface {
@@ -3361,14 +5771,14 @@ type Adb interface {
 }
 
 type Server struct {
-	Device   DeviceSource
-	Queue    JobQueue
-	History  History
-	Adb      Adb
-	Paths    paths.Paths
-	Static   fs.FS
-	LoadCfg  func() (store.Config, error)
-	SaveCfg  func(store.Config) error
+	Device  DeviceSource
+	Queue   JobQueue
+	History History
+	Adb     Adb
+	Paths   paths.Paths
+	Static  fs.FS
+	LoadCfg func() (store.Config, error)
+	SaveCfg func(store.Config) error
 }
 
 // Handler merakit seluruh rute.
@@ -3376,6 +5786,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/device/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/device/select", s.handleSelectDevice)
 	mux.HandleFunc("GET /api/apks", s.handleListAPKs)
 	mux.HandleFunc("POST /api/apks/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/apks/url", s.handleFromURL)
@@ -3441,6 +5852,31 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if err := s.Device.Refresh(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Device.Current())
+}
+
+// handleSelectDevice memilih perangkat aktif ketika lebih dari satu tersambung.
+// Serial yang tidak dikenal dibalas 404; serial kosong dibalas 400.
+func (s *Server) handleSelectDevice(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Serial string `json:"serial"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if strings.TrimSpace(req.Serial) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("serial wajib diisi"))
+		return
+	}
+	if err := s.Device.Select(req.Serial); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
 	if err := s.Device.Refresh(r.Context()); err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -3569,6 +6005,9 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if entries == nil {
+		entries = []store.Entry{}
+	}
 	writeJSON(w, http.StatusOK, entries)
 }
 
@@ -3679,6 +6118,7 @@ type apkEntry struct {
 	Package     string `json:"package,omitempty"`
 	VersionName string `json:"versionName,omitempty"`
 	VersionCode int64  `json:"versionCode,omitempty"`
+	MinSDK      int    `json:"minSdk,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
 
@@ -3699,6 +6139,7 @@ func (s *Server) entryFor(path string) apkEntry {
 	e.Package = meta.Package
 	e.VersionName = meta.VersionName
 	e.VersionCode = meta.VersionCode
+	e.MinSDK = meta.MinSDK
 	return e
 }
 
@@ -3773,6 +6214,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := s.entryFor(dest)
+	if entry.Error != "" {
+		// Berkas yang bukan APK yang sah ditolak di sini, sama seperti jalur URL,
+		// dan tidak ditinggalkan di folder unggahan (spec 7).
+		_ = os.Remove(dest)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("berkas bukan APK yang sah: %s", entry.Error))
+		return
+	}
 	writeJSON(w, http.StatusOK, entry)
 }
 
@@ -3838,7 +6286,7 @@ func (s *Server) handleFromURL(w http.ResponseWriter, r *http.Request) {
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/httpapi/ -v`
-Expected: PASS untuk kedelapan tes.
+Expected: PASS untuk seluruh tes httpapi.
 
 - [ ] **Step 6: Commit**
 
@@ -3846,6 +6294,32 @@ Expected: PASS untuk kedelapan tes.
 git add internal/httpapi
 git commit -m "feat(httpapi): API REST, SSE, dan pengelolaan berkas APK"
 ```
+
+### Hardening pasca-tinjauan (guard lintas situs)
+
+Bind loopback saja tidak cukup: halaman web mana pun bisa mengirim permintaan
+"simple request" CORS ke `127.0.0.1` dan server tetap menerimanya. Karena itu,
+di `localOnly` (berjalan untuk setiap rute sebelum handler):
+
+- `Host` wajib loopback (`127.0.0.1`, `localhost`, `::1`, dengan/tanpa port,
+  dengan/tanpa titik akhir), diperiksa memakai `net.SplitHostPort` dan
+  `strings.EqualFold`.
+- Bila header `Origin` ada, ia harus origin loopback berskema `http`
+  (`http://127.0.0.1[:port]`, `http://localhost[:port]`, `http://[::1][:port]`);
+  selain itu `403`.
+- Bila header `Sec-Fetch-Site` ada, nilainya harus `same-origin` atau `none`;
+  selain itu `403`.
+- Permintaan tanpa kedua header (mis. `curl`, skrip) tetap dilayani.
+
+Endpoint JSON (`POST /api/jobs`, `/api/jobs/cancel`, `/api/device/refresh`,
+`/api/config`, `/api/apks/url`, `/api/packages/detail`) juga menolak
+`Content-Type` yang bukan `application/json` dengan `415` (akhiran
+`; charset=...` diterima). Ini memblokir `text/plain` yang boleh dikirim lintas
+situs tanpa preflight. Selain itu `handleFromURL` mengunduh ke berkas
+`<dest>.part` lalu `os.Rename` setelah tervalidasi (APK lama tidak rusak),
+memakai `http.NewRequestWithContext` dengan klien berbatas waktu 15 menit dan
+maksimal 5 pengalihan, serta menolak unduhan di atas 2 GiB. `handleUpload`
+dibatasi `http.MaxBytesReader` dan membalas `413` bila melewati batas.
 
 ---
 
@@ -3939,6 +6413,7 @@ Create `internal/webui/static/index.html`:
   <div class="device">
     <span id="dot" class="dot"></span>
     <span id="device-label">Memeriksa perangkat...</span>
+    <select id="device-select" class="hidden" aria-label="Pilih perangkat"></select>
   </div>
   <button id="refresh" class="secondary">Pindai ulang</button>
 </header>
@@ -3974,7 +6449,7 @@ Create `internal/webui/static/index.html`:
 
     <table id="apk-table">
       <thead>
-        <tr><th></th><th>Berkas</th><th>Paket</th><th>Versi</th><th>Ukuran</th></tr>
+        <tr><th></th><th>Berkas</th><th>Paket</th><th>Versi</th><th>minSdk</th><th>Ukuran</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -3986,16 +6461,23 @@ Create `internal/webui/static/index.html`:
   <section id="tab-installed" class="panel">
     <div class="toolbar">
       <input id="search" class="grow" placeholder="Cari aplikasi...">
+      <div class="filters" role="group" aria-label="Filter aplikasi">
+        <button class="chip filter active" data-filter="all">Semua</button>
+        <button class="chip filter" data-filter="third">Pihak ketiga</button>
+        <button class="chip filter" data-filter="system">Sistem</button>
+      </div>
       <select id="sort">
         <option value="name">Urut nama</option>
-        <option value="system">Aplikasi sistem dulu</option>
+        <option value="size" disabled>Urut ukuran</option>
+        <option value="date" disabled>Urut tanggal</option>
       </select>
-      <label><input type="checkbox" id="show-system"> Tampilkan sistem</label>
+      <button id="load-details" class="secondary">Muat detail</button>
       <button id="reload-packages" class="secondary">Muat ulang</button>
     </div>
+    <div id="sort-hint" class="muted small">Muat detail dulu untuk mengaktifkan urut ukuran/tanggal.</div>
     <table id="pkg-table">
       <thead>
-        <tr><th></th><th>Paket</th><th>Versi</th><th>Aksi</th></tr>
+        <tr><th></th><th>Paket</th><th>Versi</th><th>Ukuran</th><th>Tanggal</th><th>Aksi</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -4008,22 +6490,29 @@ Create `internal/webui/static/index.html`:
 </main>
 
 <section class="bottom">
-  <div class="tabs small">
-    <button class="tab active" data-tab="queue">Antrean</button>
-    <button class="tab" data-tab="history">Riwayat</button>
-  </div>
-  <div id="tab-queue" class="panel active">
-    <ul id="queue-list" class="jobs"></ul>
-  </div>
-  <div id="tab-history" class="panel">
-    <div class="row">
-      <button id="export-csv" class="secondary">Ekspor CSV</button>
-      <button id="export-json" class="secondary">Ekspor JSON</button>
+  <button id="bottom-toggle" class="bottom-header" aria-expanded="true">
+    <span>Antrean &amp; Riwayat</span>
+    <span class="chevron" aria-hidden="true">▾</span>
+  </button>
+  <div class="bottom-body">
+    <div class="tabs small">
+      <button class="tab active" data-tab="queue">Antrean</button>
+      <button class="tab" data-tab="history">Riwayat</button>
     </div>
-    <table id="history-table">
-      <thead><tr><th>Waktu</th><th>Aksi</th><th>Paket</th><th>Hasil</th><th>Catatan</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div id="tab-queue" class="panel active">
+      <ul id="queue-list" class="jobs"></ul>
+    </div>
+    <div id="tab-history" class="panel">
+      <div class="row">
+        <input id="history-filter" class="grow" placeholder="Saring riwayat (aksi, paket, catatan)...">
+        <button id="export-csv" class="secondary">Ekspor CSV</button>
+        <button id="export-json" class="secondary">Ekspor JSON</button>
+      </div>
+      <table id="history-table">
+        <thead><tr><th>Waktu</th><th>Aksi</th><th>Paket</th><th>Hasil</th><th>Catatan</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
 </section>
 
@@ -4128,6 +6617,25 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: #111827; color: #fff; padding: 10px 14px; border-radius: 8px;
   box-shadow: 0 6px 20px rgba(0,0,0,.2); z-index: 20;
 }
+.small { font-size: 12px; }
+.filters { display: flex; gap: 4px; }
+.chip {
+  padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--muted); cursor: pointer;
+}
+.chip.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row-actions button { padding: 4px 8px; font-size: 12px; }
+.bottom-header {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px 8px 0 0;
+  background: var(--panel); cursor: pointer; font-weight: 600;
+}
+.bottom .tabs.small { padding: 8px 8px 0; }
+.bottom .panel { border-radius: 0 0 8px 8px; }
+.chevron { transition: transform .15s ease; }
+.bottom.collapsed .chevron { transform: rotate(-90deg); }
+.bottom.collapsed .bottom-body { display: none; }
 ```
 
 - [ ] **Step 6: Tulis logika UI**
@@ -4138,7 +6646,32 @@ Create `internal/webui/static/app.js`:
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const state = { apks: [], packages: [], selectedApks: new Set(), selectedPkgs: new Set(), jobs: new Map() };
+
+// escapeHtml mengubah karakter khusus HTML menjadi entitas. Semua nilai yang
+// berasal dari perangkat atau berkas pengguna harus dilewatkan helper ini
+// sebelum masuk innerHTML, supaya nama berkas yang jahat tidak menyuntikkan
+// skrip (stored XSS).
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+const state = {
+  apks: [],
+  packages: [],
+  pkgDetail: {},
+  pkgFilter: 'all',
+  history: [],
+  selectedApks: new Set(),
+  selectedPkgs: new Set(),
+  jobs: new Map(),
+  deviceReady: false,
+  selectedDevice: '',
+};
 
 function toast(message, isError) {
   const el = $('toast');
@@ -4182,13 +6715,30 @@ function humanSize(bytes) {
   return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+function deviceReady() {
+  return state.deviceReady;
+}
+
+// updateActionButtons menonaktifkan aksi yang memerlukan perangkat siap
+// (spec §7) dan yang belum punya pilihan.
+function updateActionButtons() {
+  const ready = deviceReady();
+  $('load-folder').disabled = !ready;
+  $('install-selected').disabled = !ready || state.selectedApks.size === 0;
+  $('uninstall-selected').disabled = !ready || state.selectedPkgs.size === 0;
+  $('uninstall-keep-selected').disabled = !ready || state.selectedPkgs.size === 0;
+}
+
 function renderDevice(status) {
+  state.deviceReady = status.state === 'ready';
   const dot = $('dot');
   dot.className = 'dot ' + status.state;
   const label = $('device-label');
   const hint = $('hint');
   if (status.state === 'ready') {
-    label.textContent = `${status.model || status.serial} · siap`;
+    const name = status.model || status.serial || 'Perangkat';
+    const version = status.androidVersion ? ` · Android ${status.androidVersion}` : '';
+    label.textContent = `${name}${version} · siap`;
     hint.classList.add('hidden');
   } else if (status.state === 'unauthorized') {
     label.textContent = 'Perangkat belum diizinkan';
@@ -4203,6 +6753,35 @@ function renderDevice(status) {
     hint.textContent = 'Sambungkan HP dengan kabel USB dan pastikan USB debugging menyala.';
     hint.classList.remove('hidden');
   }
+  updateActionButtons();
+  renderDevicePicker(status);
+  renderApks();
+  renderPackages();
+}
+
+// renderDevicePicker menampilkan pemilih perangkat kecil saat lebih dari satu
+// perangkat tersambung (atau saat pengguna sudah memilih salah satunya).
+function renderDevicePicker(status) {
+  const sel = $('device-select');
+  const serials = [status.serial, ...(status.others || [])].filter(Boolean);
+  const show = (status.others && status.others.length > 0) || !!state.selectedDevice;
+  if (!show || serials.length === 0) {
+    sel.classList.add('hidden');
+    sel.innerHTML = '';
+    return;
+  }
+  if (state.selectedDevice && !serials.includes(state.selectedDevice)) {
+    state.selectedDevice = '';
+  }
+  sel.classList.remove('hidden');
+  sel.innerHTML = '';
+  serials.forEach((serial) => {
+    const opt = document.createElement('option');
+    opt.value = serial;
+    opt.textContent = serial;
+    if (serial === (state.selectedDevice || status.serial)) opt.selected = true;
+    sel.appendChild(opt);
+  });
 }
 
 function renderApks() {
@@ -4213,9 +6792,10 @@ function renderApks() {
     if (state.selectedApks.has(apk.path)) tr.classList.add('selected');
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedApks.has(apk.path) ? 'checked' : ''}></td>
-      <td>${apk.name}</td>
-      <td>${apk.package || '<span class="muted">tidak terbaca</span>'}</td>
-      <td>${apk.versionName || '-'}</td>
+      <td>${escapeHtml(apk.name)}</td>
+      <td>${apk.package ? escapeHtml(apk.package) : '<span class="muted">tidak terbaca</span>'}</td>
+      <td>${escapeHtml(apk.versionName || '-')}</td>
+      <td>${apk.minSdk || '-'}</td>
       <td>${humanSize(apk.size)}</td>`;
     if (apk.error) tr.title = apk.error;
     tr.querySelector('input').addEventListener('change', (e) => {
@@ -4225,7 +6805,7 @@ function renderApks() {
     tbody.appendChild(tr);
   });
   $('install-selected').textContent = `Pasang terpilih (${state.selectedApks.size})`;
-  $('install-selected').disabled = state.selectedApks.size === 0;
+  updateActionButtons();
 }
 
 function addApk(entry) {
@@ -4234,25 +6814,58 @@ function addApk(entry) {
   renderApks();
 }
 
-function renderPackages() {
+// filteredPackages mengembalikan daftar paket yang cocok dengan pencarian.
+function filteredPackages() {
   const term = $('search').value.toLowerCase();
+  return state.packages.filter((p) => p.name.toLowerCase().includes(term));
+}
+
+function detailFor(name) {
+  return state.pkgDetail[name] || null;
+}
+
+function updateSortOptions() {
+  const has = Object.keys(state.pkgDetail).length > 0;
+  $('sort').querySelectorAll('option[value="size"], option[value="date"]')
+    .forEach((o) => { o.disabled = !has; });
+  $('sort-hint').classList.toggle('hidden', has);
+}
+
+function renderPackages() {
   const sortMode = $('sort').value;
+  const hasDetail = Object.keys(state.pkgDetail).length > 0;
+  // Urut ukuran/tanggal butuh detail; sebelum itu jatuh kembali ke urut nama.
+  const mode = (sortMode === 'size' || sortMode === 'date') && !hasDetail ? 'name' : sortMode;
+
   const tbody = $('pkg-table').querySelector('tbody');
   tbody.innerHTML = '';
 
-  let rows = state.packages.filter((p) => p.name.toLowerCase().includes(term));
-  if (!sortMode.startsWith('system')) rows = rows.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const rows = filteredPackages();
+  if (mode === 'name') {
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (mode === 'size') {
+    rows.sort((a, b) => (detailFor(a.name)?.sizeBytes || 0) - (detailFor(b.name)?.sizeBytes || 0));
+  } else if (mode === 'date') {
+    rows.sort((a, b) => (detailFor(a.name)?.installTime || '').localeCompare(detailFor(b.name)?.installTime || ''));
+  }
 
   rows.forEach((pkg) => {
     const tr = document.createElement('tr');
     const locked = pkg.system;
+    const ready = deviceReady();
+    const detail = detailFor(pkg.name);
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedPkgs.has(pkg.name) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
-      <td>${pkg.name} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
-      <td>${pkg.versionCode || '-'}</td>
-      <td>
+      <td>${escapeHtml(pkg.name)} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
+      <td>${escapeHtml(pkg.versionCode || '-')}</td>
+      <td>${detail ? humanSize(detail.sizeBytes) : '-'}</td>
+      <td>${escapeHtml(detail?.installTime || '-')}</td>
+      <td class="row-actions">
         <button class="secondary" data-act="detail">Detail</button>
-        <button class="danger" data-act="uninstall" ${locked ? 'disabled' : ''}>Copot</button>
+        <button class="danger" data-act="uninstall" ${locked || !ready ? 'disabled' : ''}>Copot</button>
+        <button class="secondary" data-act="uninstall_keep" ${locked || !ready ? 'disabled' : ''}>Copot (simpan data)</button>
+        <button class="secondary" data-act="clear_data" ${!ready ? 'disabled' : ''}>Hapus data</button>
+        <button class="secondary" data-act="pull" ${!ready ? 'disabled' : ''}>Tarik APK</button>
       </td>`;
     tr.querySelector('input').addEventListener('change', (e) => {
       if (e.target.checked) state.selectedPkgs.add(pkg.name); else state.selectedPkgs.delete(pkg.name);
@@ -4260,13 +6873,23 @@ function renderPackages() {
     });
     tr.querySelector('[data-act=detail]').addEventListener('click', () => showDetail(pkg.name));
     tr.querySelector('[data-act=uninstall]').addEventListener('click', () => {
-      if (confirm(`Copot ${pkg.name}?`)) createJobs('uninstall', [pkg.name]);
+      if (confirm(`Copot ${pkg.name}? Tindakan ini menghapus aplikasi dari HP.`)) createJobs('uninstall', [pkg.name]);
+    });
+    tr.querySelector('[data-act=uninstall_keep]').addEventListener('click', () => {
+      if (confirm(`Copot ${pkg.name} tapi simpan datanya?`)) createJobs('uninstall_keep', [pkg.name]);
+    });
+    tr.querySelector('[data-act=clear_data]').addEventListener('click', () => {
+      if (confirm(`Hapus data ${pkg.name}? Aplikasi tetap terpasang.`)) createJobs('clear_data', [pkg.name]);
+    });
+    tr.querySelector('[data-act=pull]').addEventListener('click', () => {
+      if (confirm(`Tarik APK ${pkg.name} ke folder hasil?`)) createJobs('pull', [pkg.name]);
     });
     tbody.appendChild(tr);
   });
 
   $('uninstall-selected').textContent = `Copot terpilih (${state.selectedPkgs.size})`;
   $('uninstall-keep-selected').textContent = `Copot (simpan data) (${state.selectedPkgs.size})`;
+  updateActionButtons();
 }
 
 async function showDetail(name) {
@@ -4279,18 +6902,54 @@ async function showDetail(name) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ package: name }),
     });
-    el.innerHTML = `<h3>${info.package}</h3>
+    el.innerHTML = `<h3>${escapeHtml(info.package)}</h3>
       <dl>
-        <dt>Versi</dt><dd>${info.versionName || '-'} (kode ${info.versionCode || '-'})</dd>
+        <dt>Versi</dt><dd>${escapeHtml(info.versionName || '-')} (kode ${escapeHtml(info.versionCode || '-')})</dd>
         <dt>Ukuran data</dt><dd>${humanSize(info.sizeBytes)}</dd>
-        <dt>Terpasang</dt><dd>${info.installTime || '-'}</dd>
-        <dt>Diperbarui</dt><dd>${info.updateTime || '-'}</dd>
-        <dt>APK</dt><dd>${info.apkPath || '-'}</dd>
-        <dt>Izin</dt><dd>${(info.permissions || []).join('<br>') || '-'}</dd>
+        <dt>Terpasang</dt><dd>${escapeHtml(info.installTime || '-')}</dd>
+        <dt>Diperbarui</dt><dd>${escapeHtml(info.updateTime || '-')}</dd>
+        <dt>APK</dt><dd>${escapeHtml(info.apkPath || '-')}</dd>
+        <dt>Izin</dt><dd>${(info.permissions || []).map(escapeHtml).join('<br>') || '-'}</dd>
       </dl>`;
   } catch (err) {
     el.textContent = 'Gagal memuat detail: ' + err.message;
   }
+}
+
+// loadDetails memperkaya baris yang terlihat dengan ukuran dan tanggal
+// terpasang, dengan concurrency terbatas (4 sekaligus).
+async function loadDetails() {
+  const targets = filteredPackages().map((p) => p.name).filter((n) => !state.pkgDetail[n]);
+  const btn = $('load-details');
+  if (!targets.length) {
+    toast('Detail sudah dimuat untuk baris yang terlihat');
+    updateSortOptions();
+    return;
+  }
+  btn.disabled = true;
+  const total = targets.length;
+  let done = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < targets.length) {
+      const name = targets[next++];
+      try {
+        state.pkgDetail[name] = await api('/api/packages/detail', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ package: name }),
+        });
+      } catch (e) { /* baris ini tetap tanpa detail */ }
+      done++;
+      btn.textContent = `Muat detail (${done}/${total})`;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, targets.length) }, worker));
+  btn.disabled = false;
+  btn.textContent = 'Muat detail';
+  updateSortOptions();
+  renderPackages();
+  toast(`Detail dimuat untuk ${done} aplikasi`);
 }
 
 function renderJobs() {
@@ -4305,10 +6964,10 @@ function renderJobs() {
     const li = document.createElement('li');
     const running = job.status === 'running' || job.status === 'queued';
     li.innerHTML = `
-      <div><strong>${job.label || job.target}</strong>
-        <span class="status-${job.status}">${job.status}</span></div>
-      <div class="meta">${job.message || ''} ${job.error ? '· ' + job.error : ''} ${job.result ? '· ' + job.result : ''}</div>
-      <div class="progress"><span style="width:${job.status === 'success' ? 100 : job.progress || 0}%"></span></div>
+      <div><strong>${escapeHtml(job.label || job.target)}</strong>
+        <span class="status-${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>
+      <div class="meta">${escapeHtml(job.message || '')} ${job.error ? '· ' + escapeHtml(job.error) : ''} ${job.result ? '· ' + escapeHtml(job.result) : ''}</div>
+      <div class="progress"><span style="width:${job.status === 'success' ? 100 : (Number(job.progress) || 0)}%"></span></div>
       ${running ? '<button class="secondary" data-cancel>Batalkan</button>' : ''}`;
     if (running) {
       li.querySelector('[data-cancel]').addEventListener('click', () => {
@@ -4346,26 +7005,50 @@ async function createJobs(kind, targets) {
 
 async function loadHistory() {
   try {
-    const entries = await api('/api/history?limit=200');
-    const tbody = $('history-table').querySelector('tbody');
-    tbody.innerHTML = '';
-    entries.forEach((e) => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${new Date(e.time).toLocaleString('id-ID')}</td>
-        <td>${e.action}</td><td>${e.package || '-'}</td>
-        <td class="${e.success ? 'status-success' : 'status-failed'}">${e.success ? 'sukses' : 'gagal'}</td>
-        <td>${e.detail || ''}</td>`;
-      tbody.appendChild(tr);
-    });
+    const raw = await api('/api/history?limit=200');
+    state.history = Array.isArray(raw) ? raw : [];
+    renderHistory();
   } catch (err) {
     toast(err.message, true);
   }
 }
 
+function renderHistory() {
+  const term = ($('history-filter').value || '').toLowerCase();
+  const tbody = $('history-table').querySelector('tbody');
+  tbody.innerHTML = '';
+  state.history
+    .filter((e) => !term || [e.action, e.package, e.detail]
+      .some((f) => (f || '').toLowerCase().includes(term)))
+    .forEach((e) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${escapeHtml(new Date(e.time).toLocaleString('id-ID'))}</td>
+        <td>${escapeHtml(e.action)}</td><td>${escapeHtml(e.package || '-')}</td>
+        <td class="${e.success ? 'status-success' : 'status-failed'}">${e.success ? 'sukses' : 'gagal'}</td>
+        <td>${escapeHtml(e.detail || '')}</td>`;
+      tbody.appendChild(tr);
+    });
+}
+
 async function loadPackages() {
   try {
-    const system = $('show-system').checked ? '1' : '0';
-    state.packages = await api(`/api/packages?system=${system}`);
+    if (state.pkgFilter === 'all') {
+      // "Semua" menggabungkan pihak ketiga dan sistem, dedup per nama.
+      const [third, system] = await Promise.all([
+        api('/api/packages?system=0'),
+        api('/api/packages?system=1'),
+      ]);
+      const byName = new Map();
+      (Array.isArray(third) ? third : []).forEach((p) => byName.set(p.name, p));
+      (Array.isArray(system) ? system : []).forEach((p) => byName.set(p.name, { ...p, system: true }));
+      state.packages = Array.from(byName.values());
+    } else {
+      const list = await api(`/api/packages?system=${state.pkgFilter === 'system' ? '1' : '0'}`);
+      state.packages = (Array.isArray(list) ? list : []).map((p) => ({
+        ...p,
+        system: state.pkgFilter === 'system',
+      }));
+    }
     renderPackages();
   } catch (err) {
     toast('Gagal memuat daftar aplikasi: ' + err.message, true);
@@ -4418,14 +7101,45 @@ async function uploadFile(file) {
   }
 }
 
+function setupBottomToggle() {
+  const section = document.querySelector('.bottom');
+  const toggle = $('bottom-toggle');
+  const collapsed = localStorage.getItem('adbapp.bottomCollapsed') === '1';
+  section.classList.toggle('collapsed', collapsed);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+
+  toggle.addEventListener('click', () => {
+    const next = !section.classList.contains('collapsed');
+    section.classList.toggle('collapsed', next);
+    toggle.setAttribute('aria-expanded', String(!next));
+    localStorage.setItem('adbapp.bottomCollapsed', next ? '1' : '0');
+  });
+}
+
 function bind() {
   $('refresh').addEventListener('click', () =>
     api('/api/device/refresh', { method: 'POST' }).catch((e) => toast(e.message, true)));
+  $('device-select').addEventListener('change', async (e) => {
+    state.selectedDevice = e.target.value;
+    try {
+      const st = await api('/api/device/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serial: state.selectedDevice }),
+      });
+      renderDevice(st);
+      loadPackages();
+    } catch (err) {
+      toast(err.message, true);
+      state.selectedDevice = '';
+    }
+  });
   $('load-folder').addEventListener('click', async () => {
     const folder = $('folder').value.trim();
     if (!folder) { toast('Isi dulu folder koleksi', true); return; }
     try {
-      state.apks = await api(`/api/apks?folder=${encodeURIComponent(folder)}`);
+      const list = await api(`/api/apks?folder=${encodeURIComponent(folder)}`);
+      state.apks = Array.isArray(list) ? list : [];
       renderApks();
       await api('/api/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4459,9 +7173,17 @@ function bind() {
     }
   });
   $('reload-packages').addEventListener('click', loadPackages);
-  $('show-system').addEventListener('change', loadPackages);
+  $('load-details').addEventListener('click', loadDetails);
+  document.querySelectorAll('.filter').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter').forEach((b) => b.classList.toggle('active', b === btn));
+      state.pkgFilter = btn.dataset.filter;
+      loadPackages();
+    });
+  });
   $('search').addEventListener('input', renderPackages);
   $('sort').addEventListener('change', renderPackages);
+  $('history-filter').addEventListener('input', renderHistory);
   $('export-csv').addEventListener('click', () => { window.location = '/api/history/export?format=csv'; });
   $('export-json').addEventListener('click', () => { window.location = '/api/history/export?format=json'; });
 }
@@ -4469,7 +7191,9 @@ function bind() {
 async function boot() {
   bind();
   setupDropZone();
+  setupBottomToggle();
   connectEvents();
+  updateSortOptions();
   try {
     const snapshot = await api('/api/state');
     renderDevice(snapshot.device);
@@ -4594,7 +7318,9 @@ func run(port int, noOpen bool, dataDir string) error {
 	log.Printf("adb siap: %s", adbPath)
 
 	base := adbx.New(adbPath)
-	monitor := device.New(base)
+	monitor := device.New(base, device.WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+		return base.WithSerial(serial).Output(ctx, "shell", "getprop", "ro.build.version.release")
+	}))
 	history := store.New(p.HistoryFile)
 
 	targeted := &targetedRunner{base: base, monitor: monitor}
@@ -4756,26 +7482,39 @@ GOARCH ?= $(shell go env GOARCH)
 PT_V   := 35.0.2
 
 PLATFORM := $(GOOS)-$(GOARCH)
-ADB_NAME := adb
+
+# Arsip platform-tools memakai akhiran -linux.zip / -darwin.zip, sedangkan
+# Windows memakai -win.zip (bukan -windows.zip).
+PT_OS := $(GOOS)
 ifeq ($(GOOS),windows)
-ADB_NAME := adb.exe
+PT_OS := win
 endif
-ADB_DEST := internal/bundle/bin/$(PLATFORM)/$(ADB_NAME)
+
+# adb.exe di Windows memuat AdbWinApi.dll secara statis, jadi DLL bawaan
+# platform-tools harus ikut diekstrak berdampingan dengan adb.exe; tanpa itu
+# adb tidak bisa dijalankan.
+PT_FILES := adb
+ifeq ($(GOOS),windows)
+PT_FILES := adb.exe AdbWinApi.dll AdbWinUsbApi.dll
+endif
+
+ADB_DIR := internal/bundle/bin/$(PLATFORM)
 
 .PHONY: test build run fetch-adb clean fmt vet release
 
 fetch-adb:
 	@echo "mengunduh platform-tools $(PT_V) untuk $(GOOS)"
 	@tmp=$$(mktemp -d); \
-	url="https://dl.google.com/android/repository/platform-tools_r$(PT_V)-$(GOOS).zip"; \
+	url="https://dl.google.com/android/repository/platform-tools_r$(PT_V)-$(PT_OS).zip"; \
 	echo "$$url"; \
 	curl -fsSL -o $$tmp/pt.zip "$$url" || { echo "unduhan gagal"; exit 1; }; \
 	unzip -q -o $$tmp/pt.zip -d $$tmp; \
-	mkdir -p internal/bundle/bin/$(PLATFORM); \
-	cp $$tmp/platform-tools/$(ADB_NAME) $(ADB_DEST); \
-	chmod +x $(ADB_DEST); \
+	mkdir -p $(ADB_DIR); \
+	for f in $(PT_FILES); do cp "$$tmp/platform-tools/$$f" "$(ADB_DIR)/$$f"; done; \
+	chmod +x "$(ADB_DIR)/adb" 2>/dev/null || true; \
+	chmod +x "$(ADB_DIR)/adb.exe" 2>/dev/null || true; \
 	rm -rf $$tmp; \
-	ls -l $(ADB_DEST)
+	ls -l $(ADB_DIR)
 
 test:
 	go test ./...
@@ -4797,7 +7536,11 @@ clean:
 ```
 
 Catatan: nama arsip platform-tools memakai pola
-`platform-tools_r<versi>-<os>.zip` (untuk Windows: `...-windows.zip`). Bila
+`platform-tools_r<versi>-<os>.zip`. Linux/macOS memakai `-linux.zip` /
+`-darwin.zip`, sedangkan Windows memakai `-win.zip` (bukan `-windows.zip`).
+Di Windows, `adb.exe` memuat `AdbWinApi.dll` secara statis sehingga
+`AdbWinApi.dll` dan `AdbWinUsbApi.dll` harus ikut dikirim di folder
+`internal/bundle/bin/<os>-<arch>/`; tanpa itu adb gagal dijalankan. Bila
 unduhan gagal karena pola berubah, periksa
 `https://developer.android.com/tools/releases/platform-tools` dan sesuaikan
 variabel `PT_V`.
@@ -4841,7 +7584,7 @@ jobs:
           - runner: ubuntu-latest
             goos: windows
             goarch: amd64
-            platform_tools: windows
+            platform_tools: win
             archive: zip
           - runner: macos-latest
             goos: darwin
@@ -4868,15 +7611,21 @@ jobs:
         run: |
           set -euo pipefail
           PT_VERSION=35.0.2
-          ADB_NAME=adb
-          if [ "${{ matrix.goos }}" = "windows" ]; then ADB_NAME=adb.exe; fi
+          PT_OS="${{ matrix.platform_tools }}"
+          # adb.exe di Windows memuat AdbWinApi.dll secara statis, jadi DLL itu
+          # harus ikut diekstrak berdampingan dengan adb.exe.
+          FILES=(adb)
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            FILES=(adb.exe AdbWinApi.dll AdbWinUsbApi.dll)
+          fi
           DEST="internal/bundle/bin/${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "$DEST"
           curl -fsSL -o pt.zip \
-            "https://dl.google.com/android/repository/platform-tools_r${PT_VERSION}-${{ matrix.platform_tools }}.zip"
+            "https://dl.google.com/android/repository/platform-tools_r${PT_VERSION}-${PT_OS}.zip"
           unzip -q -o pt.zip
-          cp "platform-tools/${ADB_NAME}" "$DEST/${ADB_NAME}"
-          chmod +x "$DEST/${ADB_NAME}" || true
+          for f in "${FILES[@]}"; do cp "platform-tools/$f" "$DEST/$f"; done
+          chmod +x "$DEST/adb" 2>/dev/null || true
+          chmod +x "$DEST/adb.exe" 2>/dev/null || true
           ls -l "$DEST"
 
       - name: Jalankan pengujian
@@ -4964,14 +7713,14 @@ Jalankan `adbapp`, lalu browser terbuka otomatis di halaman aplikasi.
 **Linux**
 
 ```bash
-curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-linux-amd64.tar.gz | tar xz -C ~/bin
+curl -fsSL https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-linux-amd64.tar.gz | tar xz -C ~/bin
 ~/bin/adbapp
 ```
 
 **macOS**
 
 ```bash
-curl -fsSL https://github.com/<user>/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
+curl -fsSL https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-darwin-arm64.tar.gz | tar xz -C ~/bin
 ~/bin/adbapp
 ```
 
@@ -5048,6 +7797,94 @@ git commit -m "docs: README pemakaian, pemasangan, dan pemecahan masalah"
 
 ---
 
+## Task 16: Publikasi ke GitHub `herlangga72`
+
+**Files:**
+- Modify: `README.md` (tautan rilis memakai akun nyata, sudah diselaraskan)
+
+Repo tujuan: `github.com/herlangga72/adbapp`. Mesin ini sudah menyiapkan `gh`
+yang login sebagai `herlangga72` dengan protokol SSH dan scope `repo`, jadi repo
+bisa dibuat dan di-push langsung. Workflow dari Task 14 sudah mengunggah aset ke
+halaman Releases, jadi tugas ini hanya menyalakan dan memverifikasinya.
+
+Repo dibuat **publik**, karena rancangan pemasangan yang disetujui memakai satu
+baris `curl` tanpa autentikasi; repo privat akan membuat tautan itu gagal dipakai
+orang lain. Bisa diubah kapan saja lewat
+`gh repo edit herlangga72/adbapp --visibility private` (dengan konsekuensi tautan
+`curl` perlu autentikasi).
+
+- [ ] **Step 1: Pastikan identitas rilis sudah benar**
+
+Run: `head -1 go.mod` dan `grep -c "herlangga72/adbapp" README.md`
+Expected: `module github.com/herlangga72/adbapp`, dan README memuat 2 tautan
+`github.com/herlangga72/adbapp`.
+
+- [ ] **Step 2: Repo GitHub dan kebijakan push berkelanjutan**
+
+Repo sudah dibuat (2026-10-01): `https://github.com/herlangga72/adbapp`, publik,
+branch default `master`, remote `origin` menunjuk ke
+`git@github.com:herlangga72/adbapp.git`. Sejak itu, **setiap langkah kerja
+di-push** supaya progres selalu terlihat di GitHub:
+
+```bash
+git push origin feat/adbapp     # setelah setiap task selesai
+```
+
+Di akhir seluruh task, gabungkan ke branch utama:
+
+```bash
+git checkout master
+git merge --no-ff feat/adbapp -m "feat: adbapp v1.0.0 (pasang dan copot aplikasi Android lewat adb)"
+git push origin master
+```
+
+Expected: `master` memuat seluruh riwayat, dan `origin` tetap menunjuk ke
+`git@github.com:herlangga72/adbapp.git`.
+
+- [ ] **Step 3: Jalankan build sekali tanpa tag untuk memastikan matriksnya hijau**
+
+```bash
+gh workflow list
+gh workflow run build-and-release.yml
+gh run list --workflow=build-and-release.yml --limit 1
+```
+
+Expected: workflow `build-and-release` terdaftar dan satu run berjalan. Tanpa tag,
+langkah unggah ke halaman rilis dilewati (memang begitu rancangannya).
+
+- [ ] **Step 4: Terbitkan versi pertama**
+
+```bash
+git tag -a v1.0.0 -m "adbapp v1.0.0"
+git push origin v1.0.0
+gh run list --workflow=build-and-release.yml --limit 1
+```
+
+Expected: satu run baru dipicu oleh tag, keempat kombinasi OS/arsitektur berhasil,
+dan langkah "Unggah ke halaman rilis" mengunggah berkas arsip.
+
+- [ ] **Step 5: Verifikasi aset rilis**
+
+Run: `gh release view v1.0.0 --json assets -q '.assets[].name'`
+Expected: `adbapp-darwin-amd64.tar.gz`, `adbapp-darwin-arm64.tar.gz`,
+`adbapp-linux-amd64.tar.gz`, dan `adbapp-windows-amd64.zip`.
+
+- [ ] **Step 6: Verifikasi tautan installer persis seperti di README**
+
+Run:
+`curl -sIL -o /dev/null -w '%{http_code}\n' https://github.com/herlangga72/adbapp/releases/latest/download/adbapp-linux-amd64.tar.gz`
+Expected: `200`.
+
+- [ ] **Step 7: Commit penyelarasan tautan (bila ada perubahan tertunda)**
+
+```bash
+git add README.md docs/superpowers/plans/2026-09-30-adb-app-manager.md docs/superpowers/specs/2026-09-30-adb-app-manager-design.md
+git commit -m "docs: arahkan tautan rilis ke github.com/herlangga72/adbapp"
+git push origin master
+```
+
+---
+
 ## Pemeriksaan akhir sebelum rilis
 
 - [ ] **Jalankan seluruh tes di tiga OS.** `go test ./...` pada Linux, macOS,
@@ -5092,9 +7929,9 @@ git commit -m "docs: README pemakaian, pemasangan, dan pemecahan masalah"
 | Copot, copot simpan data, hapus data, tarik APK | Task 6, Task 10, Task 11, Task 12 |
 | Detail paket (versi, ukuran, izin) | Task 5, Task 11, Task 12 |
 | Bulk uninstall + konfirmasi | Task 11, Task 12 |
-| Riwayat permanen + ekspor CSV/JSON | Task 9, Task 11, Task 12 |
+| Riwayat permanen + ekspor CSV/JSON | Task 9, Task 11, Task 12 (termasuk pembatalan `queued` lewat `onDone`) |
 | Pesan error yang jelas | Task 4, Task 6, Task 12 (panel petunjuk) |
-| Satu perangkat aktif + pemilih bila lebih | Task 7 (`Others`) |
+| Satu perangkat aktif + pemilih bila lebih | Task 7 (`Others`, `Select`), Task 11 (`/api/device/select`), Task 12 (pemilih) |
 | Paket per OS + adb tertanam + CI | Task 2, Task 14 |
 | Pemasangan `curl` di macOS | Task 14 (arsip), Task 15 (README) |
 | Pengujian tanpa perangkat | Task 3-11 |
@@ -5104,12 +7941,17 @@ git commit -m "docs: README pemakaian, pemasangan, dan pemecahan masalah"
 
 - `adbx.InstallOptions{Replace, AllowDowngrade, GrantAll}`, `adbx.StageFunc`
   dipakai konsisten di Task 3, 6, 10, 11, 13.
-- `queue.Job` dan `queue.Status*`/`queue.Kind*` konsisten antara Task 10, 11, 13.
-- `device.Status{State, Serial, Model, Others}` konsisten di Task 7, 11, 12, 13.
+- `queue.Job` dan `queue.Status*`/`queue.Kind*` konsisten antara Task 10, 11, 13;
+  `Cancel` job `queued` juga memanggil `onDone` agar riwayat lengkap.
+- `device.Status{State, Serial, Model, AndroidVersion, Others}` dan
+  `Monitor.Select(serial)` konsisten di Task 7, 11, 12, 13.
 - `store.Entry{Time, Action, Package, Device, Success, Detail}` konsisten di
   Task 9, 11, 13.
 - `apkmeta.Meta{Package, VersionName, Label, VersionCode, MinSDK}` dan
-  `ReadCached(path, size, modUnixNano)` konsisten di Task 8 dan 11.
+  `ReadCached(path, size, modUnixNano)` konsisten di Task 8 dan 11; `minSdk`
+  disalurkan ke `httpapi.apkEntry` dan kolom tab Pasang.
+- `httpapi.DeviceSource` memuat `Current`, `Refresh`, dan `Select`, cocok dengan
+  `device.Monitor` di Task 7 dan 13.
 - `paths.Paths` konsisten di Task 1, 11, 13.
 - Nama SSE: `event: state` dan `event: job` cocok antara Task 11 (server) dan
   Task 12 (client).
