@@ -52,7 +52,9 @@ func run(port int, noOpen bool, dataDir string) error {
 	log.Printf("adb siap: %s", adbPath)
 
 	base := adbx.New(adbPath)
-	monitor := device.New(base)
+	monitor := device.New(base, device.WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+		return base.WithSerial(serial).Output(ctx, "shell", "getprop", "ro.build.version.release")
+	}))
 	history := store.New(p.HistoryFile)
 
 	targeted := &targetedRunner{base: base, monitor: monitor}

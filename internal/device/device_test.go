@@ -209,6 +209,75 @@ func TestRefreshErrorLeavesCurrentUnchanged(t *testing.T) {
 	}
 }
 
+func TestVersionGetterCalledOncePerSerial(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			if serial != "S1" {
+				t.Fatalf("serial = %q, mau S1", serial)
+			}
+			return "13", nil
+		}),
+	)
+	for i := 0; i < 3; i++ {
+		if err := m.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("getter dipanggil %d kali, mau 1", calls)
+	}
+	if got := m.Current().AndroidVersion; got != "13" {
+		t.Fatalf("AndroidVersion = %q, mau 13", got)
+	}
+}
+
+func TestVersionGetterErrorIsTolerated(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			return "", errors.New("getprop gagal")
+		}),
+	)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh kedua: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("getter dipanggil %d kali, mau 1", calls)
+	}
+	got := m.Current()
+	if got.AndroidVersion != "" {
+		t.Fatalf("AndroidVersion = %q, mau kosong", got.AndroidVersion)
+	}
+	if got.State != StateReady {
+		t.Fatalf("State = %v, mau ready", got.State)
+	}
+}
+
+func TestVersionGetterNotCalledWhenNotReady(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "unauthorized"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			return "13", nil
+		}),
+	)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("getter dipanggil %d kali, mau 0", calls)
+	}
+}
+
 func TestLoopZeroIntervalDoesNotPanic(t *testing.T) {
 	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
 	ctx, cancel := context.WithCancel(context.Background())

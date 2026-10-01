@@ -21,26 +21,54 @@ const (
 
 // Status adalah kondisi perangkat aktif saat ini.
 type Status struct {
-	State  State    `json:"state"`
-	Serial string   `json:"serial"`
-	Model  string   `json:"model"`
-	Others []string `json:"others,omitempty"`
+	State          State    `json:"state"`
+	Serial         string   `json:"serial"`
+	Model          string   `json:"model"`
+	AndroidVersion string   `json:"androidVersion,omitempty"`
+	Others         []string `json:"others,omitempty"`
 }
 
 type lister interface {
 	Devices(ctx context.Context) ([]adbx.Device, error)
 }
 
+// VersionGetter mengambil versi Android (mis. dari getprop) untuk satu serial.
+type VersionGetter func(ctx context.Context, serial string) (string, error)
+
+// Option mengubah perilaku Monitor.
+type Option func(*Monitor)
+
+// WithVersionGetter memasang pengambil versi Android. Getter dipanggil sekali
+// per serial (hasilnya di-cache); kegagalan diabaikan dan versi dibiarkan
+// kosong supaya pemantauan tidak pernah terhenti karenanya. Getter nil diabaikan.
+func WithVersionGetter(g VersionGetter) Option {
+	return func(m *Monitor) {
+		if g != nil {
+			m.versionGetter = g
+		}
+	}
+}
+
 // Monitor memilih satu perangkat aktif dan mengingat pilihannya selama
 // perangkat itu masih tersambung.
 type Monitor struct {
-	lister  lister
-	mu      sync.RWMutex
-	current Status
+	lister        lister
+	versionGetter VersionGetter
+	mu            sync.RWMutex
+	current       Status
+	versions      map[string]string
 }
 
-func New(l lister) *Monitor {
-	return &Monitor{lister: l, current: Status{State: StateNone}}
+func New(l lister, opts ...Option) *Monitor {
+	m := &Monitor{
+		lister:   l,
+		current:  Status{State: StateNone},
+		versions: map[string]string{},
+	}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
 }
 
 // Refresh meminta daftar perangkat terbaru dan memperbarui status.
@@ -50,8 +78,32 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 		return err
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.current = pick(devices, m.current.Serial)
+	st := pick(devices, m.current.Serial)
+	m.current = st
+	var fetchSerial string
+	needFetch := false
+	if st.State == StateReady {
+		if v, ok := m.versions[st.Serial]; ok {
+			m.current.AndroidVersion = v
+		} else {
+			fetchSerial = st.Serial
+			needFetch = true
+		}
+	}
+	m.mu.Unlock()
+
+	if needFetch && m.versionGetter != nil {
+		version, verr := m.versionGetter(ctx, fetchSerial)
+		if verr != nil {
+			version = ""
+		}
+		m.mu.Lock()
+		m.versions[fetchSerial] = version
+		if m.current.Serial == fetchSerial {
+			m.current.AndroidVersion = version
+		}
+		m.mu.Unlock()
+	}
 	return nil
 }
 
