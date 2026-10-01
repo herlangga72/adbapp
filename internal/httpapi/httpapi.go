@@ -326,6 +326,9 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if entries == nil {
+		entries = []store.Entry{}
+	}
 	writeJSON(w, http.StatusOK, entries)
 }
 

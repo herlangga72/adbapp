@@ -120,6 +120,20 @@ func TestStateEndpoint(t *testing.T) {
 	}
 }
 
+func TestHistoryEmptyReturnsArray(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.History = store.New(filepath.Join(t.TempDir(), "history.jsonl"))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/history", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d", rec.Code)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "[]" {
+		t.Fatalf("body = %q, mau []", body)
+	}
+}
+
 func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 	s, fq := newTestServer(t)
 	payload := `{"kind":"uninstall","targets":["com.a","com.b"]}`
