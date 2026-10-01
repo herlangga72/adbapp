@@ -189,6 +189,119 @@ func TestEnsureFromLeavesNoTempAfterFailure(t *testing.T) {
 	assertNoTemps(t, dir)
 }
 
+func swapRename(t *testing.T, fn func(oldpath, newpath string) error) {
+	t.Helper()
+	orig := renameFile
+	renameFile = fn
+	t.Cleanup(func() { renameFile = orig })
+}
+
+func linkErr(oldpath, newpath string) error {
+	return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: os.ErrPermission}
+}
+
+// TestCopyFileTwiceIdenticalDestination meniru dua ekstraksi berurutan ke
+// tujuan yang sama dengan isi identik: salinan kedua harus sukses dan tidak
+// meninggalkan berkas sementara.
+func TestCopyFileTwiceIdenticalDestination(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "adb")
+	if err := copyFile(fsys, "bin/linux-amd64/adb", dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(fsys, "bin/linux-amd64/adb", dst); err != nil {
+		t.Fatalf("salinan kedua seharusnya sukses: %v", err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil || string(data) != "isi" {
+		t.Fatalf("isi tujuan salah: %q err=%v", data, err)
+	}
+	assertNoTemps(t, dir)
+}
+
+// TestMoveIntoPlaceToleratesIdenticalDestination memaksa rename selalu gagal
+// (meniru Windows yang menolak rename ke atas berkas tujuan yang sudah ada) dan
+// memastikan berkas tujuan identik dianggap berhasil tanpa mengganggu tujuan.
+func TestMoveIntoPlaceToleratesIdenticalDestination(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi identik"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "adb")
+	if err := os.WriteFile(dst, []byte("isi identik"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	swapRename(t, linkErr)
+	if err := copyFile(fsys, "bin/linux-amd64/adb", dst); err != nil {
+		t.Fatalf("copyFile seharusnya toleran terhadap tujuan identik: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || string(got) != "isi identik" {
+		t.Fatalf("berkas tujuan berubah: %q err=%v", got, err)
+	}
+	assertNoTemps(t, dir)
+}
+
+// TestMoveIntoPlaceRejectsDifferentDestination memastikan toleransi isi tidak
+// melemahkan pengecekan: tujuan yang isinya berbeda harus tetap dipindahkan.
+func TestMoveIntoPlaceRejectsDifferentDestination(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("baru"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "adb")
+	if err := os.WriteFile(dst, []byte("lama"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(fsys, "bin/linux-amd64/adb", dst); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || string(got) != "baru" {
+		t.Fatalf("tujuan seharusnya ditimpa dengan isi baru: %q err=%v", got, err)
+	}
+	assertNoTemps(t, dir)
+}
+
+// TestCopyFileRetriesTransientRenameFailure menyuntikkan dua kegagalan rename
+// lalu sukses, dan memastikan pemindahan dicoba ulang sampai berhasil.
+func TestCopyFileRetriesTransientRenameFailure(t *testing.T) {
+	fsys := fstest.MapFS{
+		"bin/linux-amd64/adb": &fstest.MapFile{Data: []byte("isi"), Mode: 0o644},
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "adb")
+	var mu sync.Mutex
+	calls := 0
+	swapRename(t, func(oldpath, newpath string) error {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n <= 2 {
+			return linkErr(oldpath, newpath)
+		}
+		return os.Rename(oldpath, newpath)
+	})
+	if err := copyFile(fsys, "bin/linux-amd64/adb", dst); err != nil {
+		t.Fatalf("copyFile seharusnya berhasil setelah percobaan ulang: %v", err)
+	}
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n < 3 {
+		t.Fatalf("rename seharusnya dicoba ulang, calls=%d", n)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil || string(data) != "isi" {
+		t.Fatalf("isi tujuan salah: %q err=%v", data, err)
+	}
+	assertNoTemps(t, dir)
+}
+
 func TestEnsureFromConcurrent(t *testing.T) {
 	fsys := fstest.MapFS{
 		"bin/linux-amd64/adb":        &fstest.MapFile{Data: []byte("#!/bin/sh\necho hi\n"), Mode: 0o644},

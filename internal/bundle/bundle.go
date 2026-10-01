@@ -1,6 +1,7 @@
 package bundle
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"io/fs"
@@ -9,6 +10,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+)
+
+// renameFile adalah pembungkus tipis di atas os.Rename supaya tes dapat
+// menyuntikkan kegagalan rename sementara. Jangan diubah saat runtime.
+var renameFile = os.Rename
+
+const (
+	renameAttempts = 5
+	renameBackoff  = 50 * time.Millisecond
 )
 
 // Ensure mengekstrak adb untuk OS saat ini dan mengembalikan path-nya.
@@ -116,8 +126,7 @@ func removeStaleTemps(dir string) {
 }
 
 func copyFile(fsys fs.FS, src, dst string) error {
-	info, err := fs.Stat(fsys, src)
-	if err != nil {
+	if _, err := fs.Stat(fsys, src); err != nil {
 		return fmt.Errorf("membaca %s: %w", src, err)
 	}
 	in, err := fsys.Open(src)
@@ -148,18 +157,74 @@ func copyFile(fsys fs.FS, src, dst string) error {
 		return fmt.Errorf("mengatur mode %s: %w", dst, err)
 	}
 
-	if err := os.Rename(tmpName, dst); err != nil {
-		if rmErr := os.Remove(dst); rmErr == nil {
-			if err := os.Rename(tmpName, dst); err == nil {
-				return nil
-			}
-		}
-		if st, statErr := os.Stat(dst); statErr == nil && st.Mode().IsRegular() && st.Size() == info.Size() {
-			// Berkas tujuan sudah ditulis oleh ekstraksi lain yang berjalan
-			// bersamaan; isinya identik, jadi anggap berhasil.
-			return nil
-		}
-		return fmt.Errorf("memindahkan %s ke %s: %w", tmpName, dst, err)
+	if err := moveIntoPlace(tmpName, dst); err != nil {
+		return err
 	}
 	return nil
+}
+
+// moveIntoPlace memindahkan berkas sementara tmpName menjadi dst. Di Windows,
+// os.Rename ke atas berkas tujuan yang SUDAH ada dapat gagal dengan
+// "Access is denied" ketika ada proses lain (goroutine ekstraksi paralel,
+// antivirus, atau pengindeks) memegang handle sesaat. Karena itu rename dicoba
+// beberapa kali, berkas tujuan dihapus lebih dulu sebagai upaya antara, dan
+// jika ekstraksi lain sudah menghasilkan berkas tujuan yang identik, pemindahan
+// dianggap selesai tanpa mengganggu berkas yang sudah baik.
+func moveIntoPlace(tmpName, dst string) error {
+	var lastErr error
+	for attempt := 0; attempt < renameAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(renameBackoff * time.Duration(attempt))
+		}
+		if err := renameFile(tmpName, dst); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		// Berkas tujuan sudah ditulis oleh ekstraksi lain yang berjalan
+		// bersamaan dengan isi identik; jangan ganggu, cukup buang tmp.
+		// (defer os.Remove(tmpName) di pemanggil yang membersihkannya.)
+		if sameContent(tmpName, dst) {
+			return nil
+		}
+		// Windows tidak bisa rename di atas berkas tujuan yang terkunci;
+		// hapus dulu supaya percobaan berikutnya bisa berhasil.
+		os.Remove(dst)
+	}
+	return fmt.Errorf("memindahkan %s ke %s: %w", tmpName, dst, lastErr)
+}
+
+// sameContent melaporkan apakah berkas a dan b adalah berkas biasa berukuran
+// sama dengan isi (hash SHA-256) yang sama.
+func sameContent(a, b string) bool {
+	sa, err := os.Stat(a)
+	if err != nil || !sa.Mode().IsRegular() {
+		return false
+	}
+	sb, err := os.Stat(b)
+	if err != nil || !sb.Mode().IsRegular() || sa.Size() != sb.Size() {
+		return false
+	}
+	ha, err := hashFile(a)
+	if err != nil {
+		return false
+	}
+	hb, err := hashFile(b)
+	if err != nil {
+		return false
+	}
+	return string(ha) == string(hb)
+}
+
+func hashFile(name string) ([]byte, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }
