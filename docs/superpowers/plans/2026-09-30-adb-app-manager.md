@@ -5976,6 +5976,32 @@ git add internal/httpapi
 git commit -m "feat(httpapi): API REST, SSE, dan pengelolaan berkas APK"
 ```
 
+### Hardening pasca-tinjauan (guard lintas situs)
+
+Bind loopback saja tidak cukup: halaman web mana pun bisa mengirim permintaan
+"simple request" CORS ke `127.0.0.1` dan server tetap menerimanya. Karena itu,
+di `localOnly` (berjalan untuk setiap rute sebelum handler):
+
+- `Host` wajib loopback (`127.0.0.1`, `localhost`, `::1`, dengan/tanpa port,
+  dengan/tanpa titik akhir), diperiksa memakai `net.SplitHostPort` dan
+  `strings.EqualFold`.
+- Bila header `Origin` ada, ia harus origin loopback berskema `http`
+  (`http://127.0.0.1[:port]`, `http://localhost[:port]`, `http://[::1][:port]`);
+  selain itu `403`.
+- Bila header `Sec-Fetch-Site` ada, nilainya harus `same-origin` atau `none`;
+  selain itu `403`.
+- Permintaan tanpa kedua header (mis. `curl`, skrip) tetap dilayani.
+
+Endpoint JSON (`POST /api/jobs`, `/api/jobs/cancel`, `/api/device/refresh`,
+`/api/config`, `/api/apks/url`, `/api/packages/detail`) juga menolak
+`Content-Type` yang bukan `application/json` dengan `415` (akhiran
+`; charset=...` diterima). Ini memblokir `text/plain` yang boleh dikirim lintas
+situs tanpa preflight. Selain itu `handleFromURL` mengunduh ke berkas
+`<dest>.part` lalu `os.Rename` setelah tervalidasi (APK lama tidak rusak),
+memakai `http.NewRequestWithContext` dengan klien berbatas waktu 15 menit dan
+maksimal 5 pengalihan, serta menolak unduhan di atas 2 GiB. `handleUpload`
+dibatasi `http.MaxBytesReader` dan membalas `413` bila melewati batas.
+
 ---
 
 ## Task 12: Tampilan web (`internal/webui`)

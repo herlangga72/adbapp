@@ -185,6 +185,11 @@ Folder data aplikasi mengikuti konvensi tiap OS (Windows:
 `%LOCALAPPDATA%\adbapp`; Linux: `$XDG_DATA_HOME/adbapp` atau
 `~/.local/share/adbapp`; macOS: `~/Library/Application Support/adbapp`).
 
+Server hanya mengikat `127.0.0.1`; binding loopback itu dipasangkan dengan guard
+origin peramban (`Origin`/`Sec-Fetch-Site` loopback dan `Content-Type`
+`application/json` pada endpoint JSON). Ini pengerasan desain "tanpa login",
+bukan perubahan pengalaman pengguna.
+
 **Windows** — unduh `.zip`, ekstrak, klik dua kali `adbapp.exe`.
 **Linux** — unduh `.tar.gz`, ekstrak, jalankan `./adbapp`.
 **macOS** — installer satu baris lewat Terminal (ganti `<user>` dengan pemilik
