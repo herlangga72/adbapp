@@ -110,9 +110,21 @@ func (m *Monitor) Current() Status {
 	return m.current
 }
 
+// defaultLoopInterval dipakai bila Loop diberikan interval tidak positif,
+// sebab time.NewTicker panik untuk durasi <= 0.
+const defaultLoopInterval = 2 * time.Second
+
+// loopInterval mengembalikan interval yang aman untuk time.NewTicker.
+func loopInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultLoopInterval
+	}
+	return interval
+}
+
 // Loop memantau perangkat secara berkala sampai ctx dibatalkan.
 func (m *Monitor) Loop(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(loopInterval(interval))
 	defer ticker.Stop()
 	for {
 		_ = m.Refresh(ctx)

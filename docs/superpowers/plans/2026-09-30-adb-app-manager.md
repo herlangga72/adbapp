@@ -2774,7 +2774,9 @@ package device
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/herlangga72/adbapp/internal/adbx"
 )
@@ -2786,6 +2788,29 @@ type fakeLister struct {
 
 func (f fakeLister) Devices(ctx context.Context) ([]adbx.Device, error) {
 	return f.devices, f.err
+}
+
+// scriptedLister mengembalikan daftar perangkat yang berbeda pada tiap
+// pemanggilan, sehingga dapat menguji perilaku lintas-refresh.
+type scriptedLister struct {
+	lists [][]adbx.Device
+	calls int
+	err   error
+}
+
+func (s *scriptedLister) Devices(ctx context.Context) ([]adbx.Device, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if len(s.lists) == 0 {
+		return nil, nil
+	}
+	if s.calls >= len(s.lists) {
+		return s.lists[len(s.lists)-1], nil
+	}
+	list := s.lists[s.calls]
+	s.calls++
+	return list, nil
 }
 
 func TestStatusReadyWhenOneAuthorized(t *testing.T) {
@@ -2802,13 +2827,27 @@ func TestStatusReadyWhenOneAuthorized(t *testing.T) {
 	}
 }
 
-func TestStatusUnauthorizedTakesPriority(t *testing.T) {
+func TestStatusUnauthorizedWhenNoReadyDevice(t *testing.T) {
 	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "unauthorized"}}})
 	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if m.Current().State != StateUnauthorized {
 		t.Fatalf("got %v, want unauthorized", m.Current().State)
+	}
+}
+
+func TestStatusReadyTakesPriorityOverUnauthorized(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{
+		{Serial: "S1", State: "unauthorized"},
+		{Serial: "S2", State: "device"},
+	}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Current()
+	if got.State != StateReady || got.Serial != "S2" {
+		t.Fatalf("got %v/%q, want ready/S2", got.State, got.Serial)
 	}
 }
 
@@ -2833,22 +2872,130 @@ func TestStatusOfflineWhenOnlyOffline(t *testing.T) {
 }
 
 func TestRepeatedRefreshKeepsSameSerial(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		// Urutan dibalik: S1 harus tetap terpilih (lengket, bukan first-wins).
+		{{Serial: "S2", State: "device"}, {Serial: "S1", State: "device"}},
+		// S1 dicabut: sekarang S2 yang dipakai.
+		{{Serial: "S2", State: "device"}},
+	}}
+	m := New(l)
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 1: got %q, want S1", got)
+	}
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 2 (urutan dibalik): got %q, want tetap S1", got)
+	}
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S2" {
+		t.Fatalf("refresh 3 (S1 dicabut): got %q, want S2", got)
+	}
+}
+
+func TestRefreshMovesAwayWhenPreferredOffline(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		// S1 masih terdaftar tetapi offline; cabang mengingat mensyaratkan
+		// state == "device", jadi pilihan harus pindah ke S2.
+		{{Serial: "S1", State: "offline"}, {Serial: "S2", State: "device"}},
+	}}
+	m := New(l)
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 1: got %q, want S1", got)
+	}
+
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Current()
+	if got.Serial != "S2" || got.State != StateReady {
+		t.Fatalf("refresh 2: got %q/%v, want S2/ready", got.Serial, got.State)
+	}
+}
+
+func TestModelFallsBackToProduct(t *testing.T) {
 	m := New(fakeLister{devices: []adbx.Device{
-		{Serial: "S1", State: "device"},
-		{Serial: "S2", State: "device"},
+		{Serial: "S1", State: "device", Product: "PixelProduct"},
 	}})
 	if err := m.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	first := m.Current().Serial
-	for i := 0; i < 3; i++ {
-		if err := m.Refresh(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+	if got := m.Current().Model; got != "PixelProduct" {
+		t.Fatalf("Model = %q, want PixelProduct", got)
 	}
-	if m.Current().Serial != first {
-		t.Fatalf("serial berubah dari %q ke %q padahal masih tersambung",
-			first, m.Current().Serial)
+}
+
+func TestOthersListsOtherSerials(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{
+		{Serial: "S1", State: "device"},
+		{Serial: "S2", State: "offline"},
+		{Serial: "S3", State: "unauthorized"},
+	}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	others := m.Current().Others
+	if len(others) != 2 || others[0] != "S2" || others[1] != "S3" {
+		t.Fatalf("Others = %v, want [S2 S3]", others)
+	}
+}
+
+func TestOthersEmptyForSingleDevice(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Others; len(got) != 0 {
+		t.Fatalf("Others = %v, want kosong", got)
+	}
+}
+
+func TestRefreshErrorLeavesCurrentUnchanged(t *testing.T) {
+	l := &fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	l.err = errors.New("adb gagal")
+	if err := m.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh: ingin error, dapat nil")
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("Current().Serial = %q, want tetap S1", got)
+	}
+}
+
+func TestLoopZeroIntervalDoesNotPanic(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // batalkan segera; Loop cukup tidak boleh panik.
+
+	done := make(chan struct{})
+	go func() {
+		m.Loop(ctx, 0)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop tidak berhenti setelah ctx dibatalkan")
 	}
 }
 ```
@@ -2886,7 +3033,7 @@ const (
 
 // Status adalah kondisi perangkat aktif saat ini.
 type Status struct {
-	State State     `json:"state"`
+	State  State    `json:"state"`
 	Serial string   `json:"serial"`
 	Model  string   `json:"model"`
 	Others []string `json:"others,omitempty"`
@@ -2975,9 +3122,21 @@ func (m *Monitor) Current() Status {
 	return m.current
 }
 
+// defaultLoopInterval dipakai bila Loop diberikan interval tidak positif,
+// sebab time.NewTicker panik untuk durasi <= 0.
+const defaultLoopInterval = 2 * time.Second
+
+// loopInterval mengembalikan interval yang aman untuk time.NewTicker.
+func loopInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultLoopInterval
+	}
+	return interval
+}
+
 // Loop memantau perangkat secara berkala sampai ctx dibatalkan.
 func (m *Monitor) Loop(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(loopInterval(interval))
 	defer ticker.Stop()
 	for {
 		_ = m.Refresh(ctx)
