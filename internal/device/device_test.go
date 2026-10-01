@@ -278,6 +278,61 @@ func TestVersionGetterNotCalledWhenNotReady(t *testing.T) {
 	}
 }
 
+func TestSelectPinsChosenDevice(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+	}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("refresh 1: got %q, mau S1", got)
+	}
+	if err := m.Select("S2"); err != nil {
+		t.Fatalf("Select gagal: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S2" {
+		t.Fatalf("setelah pilih: got %q, mau S2", got)
+	}
+}
+
+func TestSelectClearedWhenDeviceDisappears(t *testing.T) {
+	l := &scriptedLister{lists: [][]adbx.Device{
+		{{Serial: "S1", State: "device"}, {Serial: "S2", State: "device"}},
+		// S2 dicabut: pin harus dilepas dan pilihan jatuh ke S1.
+		{{Serial: "S1", State: "device"}},
+	}}
+	m := New(l)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Select("S2"); err != nil {
+		t.Fatalf("Select gagal: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current().Serial; got != "S1" {
+		t.Fatalf("got %q, mau S1", got)
+	}
+	// Pin sudah dilepas, jadi serial lama sekarang tidak dikenal.
+	if err := m.Select("S2"); err == nil {
+		t.Fatal("Select S2 seharusnya error setelah pin dilepas")
+	}
+}
+
+func TestSelectUnknownSerialErrors(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
+	if err := m.Select("hantu"); err == nil {
+		t.Fatal("Select serial tak dikenal seharusnya error")
+	}
+}
+
 func TestLoopZeroIntervalDoesNotPanic(t *testing.T) {
 	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
 	ctx, cancel := context.WithCancel(context.Background())

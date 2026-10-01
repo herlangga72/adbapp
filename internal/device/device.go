@@ -4,6 +4,8 @@ package device
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -56,6 +58,7 @@ type Monitor struct {
 	versionGetter VersionGetter
 	mu            sync.RWMutex
 	current       Status
+	selected      string
 	versions      map[string]string
 }
 
@@ -78,7 +81,17 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 		return err
 	}
 	m.mu.Lock()
-	st := pick(devices, m.current.Serial)
+	preferred := m.current.Serial
+	if m.selected != "" {
+		if isReadySerial(devices, m.selected) {
+			preferred = m.selected
+		} else {
+			// Pin mengarah ke perangkat yang sudah hilang atau tidak siap:
+			// lepaskan supaya pilihan kembali lengket ke perangkat aktif.
+			m.selected = ""
+		}
+	}
+	st := pick(devices, preferred)
 	m.current = st
 	var fetchSerial string
 	needFetch := false
@@ -105,6 +118,39 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 		m.mu.Unlock()
 	}
 	return nil
+}
+
+// isReadySerial melaporkan apakah serial ada di daftar dan berstatus "device".
+func isReadySerial(devices []adbx.Device, serial string) bool {
+	for _, d := range devices {
+		if d.Serial == serial && d.State == "device" {
+			return true
+		}
+	}
+	return false
+}
+
+// Select memilih perangkat aktif secara eksplisit. Serial harus dikenal pada
+// status terakhir (perangkat aktif atau salah satu pada Others); selain itu
+// dikembalikan error. Pin dihormati oleh Refresh selama perangkat itu hadir dan
+// siap, lalu dilepas otomatis bila menghilang.
+func (m *Monitor) Select(serial string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if serial == "" {
+		return errors.New("serial kosong")
+	}
+	if serial == m.current.Serial {
+		m.selected = serial
+		return nil
+	}
+	for _, s := range m.current.Others {
+		if s == serial {
+			m.selected = serial
+			return nil
+		}
+	}
+	return fmt.Errorf("perangkat %s tidak dikenal", serial)
 }
 
 func pick(devices []adbx.Device, preferred string) Status {
