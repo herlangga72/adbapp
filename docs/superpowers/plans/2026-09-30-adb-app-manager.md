@@ -5866,7 +5866,7 @@ func (s *Server) handleSelectDevice(w http.ResponseWriter, r *http.Request) {
 		Serial string `json:"serial"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("badan permintaan tidak sah: %w", err))
+		writeDecodeError(w, err)
 		return
 	}
 	if strings.TrimSpace(req.Serial) == "" {
