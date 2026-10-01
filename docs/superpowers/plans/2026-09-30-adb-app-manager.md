@@ -2068,24 +2068,24 @@ type Device struct {
 
 // Package adalah satu aplikasi yang terpasang di perangkat.
 type Package struct {
-	Name        string
-	ApkPath     string
-	VersionCode int64
-	System      bool
+	Name        string `json:"name"`
+	ApkPath     string `json:"apkPath,omitempty"`
+	VersionCode int64  `json:"versionCode,omitempty"`
+	System      bool   `json:"system,omitempty"`
 }
 
 // PackageInfo adalah detail satu aplikasi, untuk panel detail di UI.
 type PackageInfo struct {
-	Package     string
-	VersionName string
-	VersionCode int64
-	InstallTime string
-	UpdateTime  string
-	ApkPath     string
-	DataDir     string
-	SizeBytes   int64
-	Permissions []string
-	System      bool
+	Package     string   `json:"package"`
+	VersionName string   `json:"versionName,omitempty"`
+	VersionCode int64    `json:"versionCode,omitempty"`
+	InstallTime string   `json:"installTime,omitempty"`
+	UpdateTime  string   `json:"updateTime,omitempty"`
+	ApkPath     string   `json:"apkPath,omitempty"`
+	DataDir     string   `json:"dataDir,omitempty"`
+	SizeBytes   int64    `json:"sizeBytes,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+	System      bool     `json:"system,omitempty"`
 }
 
 func (r *Runner) Devices(ctx context.Context) ([]Device, error) {
@@ -2981,6 +2981,75 @@ func TestRefreshErrorLeavesCurrentUnchanged(t *testing.T) {
 	}
 }
 
+func TestVersionGetterCalledOncePerSerial(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			if serial != "S1" {
+				t.Fatalf("serial = %q, mau S1", serial)
+			}
+			return "13", nil
+		}),
+	)
+	for i := 0; i < 3; i++ {
+		if err := m.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("getter dipanggil %d kali, mau 1", calls)
+	}
+	if got := m.Current().AndroidVersion; got != "13" {
+		t.Fatalf("AndroidVersion = %q, mau 13", got)
+	}
+}
+
+func TestVersionGetterErrorIsTolerated(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			return "", errors.New("getprop gagal")
+		}),
+	)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh kedua: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("getter dipanggil %d kali, mau 1", calls)
+	}
+	got := m.Current()
+	if got.AndroidVersion != "" {
+		t.Fatalf("AndroidVersion = %q, mau kosong", got.AndroidVersion)
+	}
+	if got.State != StateReady {
+		t.Fatalf("State = %v, mau ready", got.State)
+	}
+}
+
+func TestVersionGetterNotCalledWhenNotReady(t *testing.T) {
+	calls := 0
+	m := New(
+		fakeLister{devices: []adbx.Device{{Serial: "S1", State: "unauthorized"}}},
+		WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+			calls++
+			return "13", nil
+		}),
+	)
+	if err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("getter dipanggil %d kali, mau 0", calls)
+	}
+}
+
 func TestLoopZeroIntervalDoesNotPanic(t *testing.T) {
 	m := New(fakeLister{devices: []adbx.Device{{Serial: "S1", State: "device"}}})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3033,26 +3102,54 @@ const (
 
 // Status adalah kondisi perangkat aktif saat ini.
 type Status struct {
-	State  State    `json:"state"`
-	Serial string   `json:"serial"`
-	Model  string   `json:"model"`
-	Others []string `json:"others,omitempty"`
+	State          State    `json:"state"`
+	Serial         string   `json:"serial"`
+	Model          string   `json:"model"`
+	AndroidVersion string   `json:"androidVersion,omitempty"`
+	Others         []string `json:"others,omitempty"`
 }
 
 type lister interface {
 	Devices(ctx context.Context) ([]adbx.Device, error)
 }
 
+// VersionGetter mengambil versi Android (mis. dari getprop) untuk satu serial.
+type VersionGetter func(ctx context.Context, serial string) (string, error)
+
+// Option mengubah perilaku Monitor.
+type Option func(*Monitor)
+
+// WithVersionGetter memasang pengambil versi Android. Getter dipanggil sekali
+// per serial (hasilnya di-cache); kegagalan diabaikan dan versi dibiarkan
+// kosong supaya pemantauan tidak pernah terhenti karenanya. Getter nil diabaikan.
+func WithVersionGetter(g VersionGetter) Option {
+	return func(m *Monitor) {
+		if g != nil {
+			m.versionGetter = g
+		}
+	}
+}
+
 // Monitor memilih satu perangkat aktif dan mengingat pilihannya selama
 // perangkat itu masih tersambung.
 type Monitor struct {
-	lister  lister
-	mu      sync.RWMutex
-	current Status
+	lister        lister
+	versionGetter VersionGetter
+	mu            sync.RWMutex
+	current       Status
+	versions      map[string]string
 }
 
-func New(l lister) *Monitor {
-	return &Monitor{lister: l, current: Status{State: StateNone}}
+func New(l lister, opts ...Option) *Monitor {
+	m := &Monitor{
+		lister:   l,
+		current:  Status{State: StateNone},
+		versions: map[string]string{},
+	}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
 }
 
 // Refresh meminta daftar perangkat terbaru dan memperbarui status.
@@ -3062,8 +3159,32 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 		return err
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.current = pick(devices, m.current.Serial)
+	st := pick(devices, m.current.Serial)
+	m.current = st
+	var fetchSerial string
+	needFetch := false
+	if st.State == StateReady {
+		if v, ok := m.versions[st.Serial]; ok {
+			m.current.AndroidVersion = v
+		} else {
+			fetchSerial = st.Serial
+			needFetch = true
+		}
+	}
+	m.mu.Unlock()
+
+	if needFetch && m.versionGetter != nil {
+		version, verr := m.versionGetter(ctx, fetchSerial)
+		if verr != nil {
+			version = ""
+		}
+		m.mu.Lock()
+		m.versions[fetchSerial] = version
+		if m.current.Serial == fetchSerial {
+			m.current.AndroidVersion = version
+		}
+		m.mu.Unlock()
+	}
 	return nil
 }
 
@@ -3152,7 +3273,7 @@ func (m *Monitor) Loop(ctx context.Context, interval time.Duration) {
 - [ ] **Step 4: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/device/ -v`
-Expected: PASS untuk kelima tes.
+Expected: PASS untuk seluruh tes device.
 
 - [ ] **Step 5: Commit**
 
@@ -5334,6 +5455,20 @@ func TestStateEndpoint(t *testing.T) {
 	}
 }
 
+func TestHistoryEmptyReturnsArray(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.History = store.New(filepath.Join(t.TempDir(), "history.jsonl"))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/history", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d", rec.Code)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "[]" {
+		t.Fatalf("body = %q, mau []", body)
+	}
+}
+
 func TestCreateJobsEnqueuesOnePerTarget(t *testing.T) {
 	s, fq := newTestServer(t)
 	payload := `{"kind":"uninstall","targets":["com.a","com.b"]}`
@@ -5698,6 +5833,9 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if entries == nil {
+		entries = []store.Entry{}
+	}
 	writeJSON(w, http.StatusOK, entries)
 }
 
@@ -5967,7 +6105,7 @@ func (s *Server) handleFromURL(w http.ResponseWriter, r *http.Request) {
 - [ ] **Step 5: Jalankan tes, pastikan lulus**
 
 Run: `go test ./internal/httpapi/ -v`
-Expected: PASS untuk ketujuh tes.
+Expected: PASS untuk seluruh tes httpapi.
 
 - [ ] **Step 6: Commit**
 
@@ -6141,16 +6279,23 @@ Create `internal/webui/static/index.html`:
   <section id="tab-installed" class="panel">
     <div class="toolbar">
       <input id="search" class="grow" placeholder="Cari aplikasi...">
+      <div class="filters" role="group" aria-label="Filter aplikasi">
+        <button class="chip filter active" data-filter="all">Semua</button>
+        <button class="chip filter" data-filter="third">Pihak ketiga</button>
+        <button class="chip filter" data-filter="system">Sistem</button>
+      </div>
       <select id="sort">
         <option value="name">Urut nama</option>
-        <option value="system">Aplikasi sistem dulu</option>
+        <option value="size" disabled>Urut ukuran</option>
+        <option value="date" disabled>Urut tanggal</option>
       </select>
-      <label><input type="checkbox" id="show-system"> Tampilkan sistem</label>
+      <button id="load-details" class="secondary">Muat detail</button>
       <button id="reload-packages" class="secondary">Muat ulang</button>
     </div>
+    <div id="sort-hint" class="muted small">Muat detail dulu untuk mengaktifkan urut ukuran/tanggal.</div>
     <table id="pkg-table">
       <thead>
-        <tr><th></th><th>Paket</th><th>Versi</th><th>Aksi</th></tr>
+        <tr><th></th><th>Paket</th><th>Versi</th><th>Ukuran</th><th>Tanggal</th><th>Aksi</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -6163,22 +6308,29 @@ Create `internal/webui/static/index.html`:
 </main>
 
 <section class="bottom">
-  <div class="tabs small">
-    <button class="tab active" data-tab="queue">Antrean</button>
-    <button class="tab" data-tab="history">Riwayat</button>
-  </div>
-  <div id="tab-queue" class="panel active">
-    <ul id="queue-list" class="jobs"></ul>
-  </div>
-  <div id="tab-history" class="panel">
-    <div class="row">
-      <button id="export-csv" class="secondary">Ekspor CSV</button>
-      <button id="export-json" class="secondary">Ekspor JSON</button>
+  <button id="bottom-toggle" class="bottom-header" aria-expanded="true">
+    <span>Antrean &amp; Riwayat</span>
+    <span class="chevron" aria-hidden="true">▾</span>
+  </button>
+  <div class="bottom-body">
+    <div class="tabs small">
+      <button class="tab active" data-tab="queue">Antrean</button>
+      <button class="tab" data-tab="history">Riwayat</button>
     </div>
-    <table id="history-table">
-      <thead><tr><th>Waktu</th><th>Aksi</th><th>Paket</th><th>Hasil</th><th>Catatan</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div id="tab-queue" class="panel active">
+      <ul id="queue-list" class="jobs"></ul>
+    </div>
+    <div id="tab-history" class="panel">
+      <div class="row">
+        <input id="history-filter" class="grow" placeholder="Saring riwayat (aksi, paket, catatan)...">
+        <button id="export-csv" class="secondary">Ekspor CSV</button>
+        <button id="export-json" class="secondary">Ekspor JSON</button>
+      </div>
+      <table id="history-table">
+        <thead><tr><th>Waktu</th><th>Aksi</th><th>Paket</th><th>Hasil</th><th>Catatan</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
 </section>
 
@@ -6283,6 +6435,25 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: #111827; color: #fff; padding: 10px 14px; border-radius: 8px;
   box-shadow: 0 6px 20px rgba(0,0,0,.2); z-index: 20;
 }
+.small { font-size: 12px; }
+.filters { display: flex; gap: 4px; }
+.chip {
+  padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--muted); cursor: pointer;
+}
+.chip.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row-actions button { padding: 4px 8px; font-size: 12px; }
+.bottom-header {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px 8px 0 0;
+  background: var(--panel); cursor: pointer; font-weight: 600;
+}
+.bottom .tabs.small { padding: 8px 8px 0; }
+.bottom .panel { border-radius: 0 0 8px 8px; }
+.chevron { transition: transform .15s ease; }
+.bottom.collapsed .chevron { transform: rotate(-90deg); }
+.bottom.collapsed .bottom-body { display: none; }
 ```
 
 - [ ] **Step 6: Tulis logika UI**
@@ -6293,7 +6464,17 @@ Create `internal/webui/static/app.js`:
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const state = { apks: [], packages: [], selectedApks: new Set(), selectedPkgs: new Set(), jobs: new Map() };
+const state = {
+  apks: [],
+  packages: [],
+  pkgDetail: {},
+  pkgFilter: 'all',
+  history: [],
+  selectedApks: new Set(),
+  selectedPkgs: new Set(),
+  jobs: new Map(),
+  deviceReady: false,
+};
 
 function toast(message, isError) {
   const el = $('toast');
@@ -6337,13 +6518,30 @@ function humanSize(bytes) {
   return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+function deviceReady() {
+  return state.deviceReady;
+}
+
+// updateActionButtons menonaktifkan aksi yang memerlukan perangkat siap
+// (spec §7) dan yang belum punya pilihan.
+function updateActionButtons() {
+  const ready = deviceReady();
+  $('load-folder').disabled = !ready;
+  $('install-selected').disabled = !ready || state.selectedApks.size === 0;
+  $('uninstall-selected').disabled = !ready || state.selectedPkgs.size === 0;
+  $('uninstall-keep-selected').disabled = !ready || state.selectedPkgs.size === 0;
+}
+
 function renderDevice(status) {
+  state.deviceReady = status.state === 'ready';
   const dot = $('dot');
   dot.className = 'dot ' + status.state;
   const label = $('device-label');
   const hint = $('hint');
   if (status.state === 'ready') {
-    label.textContent = `${status.model || status.serial} · siap`;
+    const name = status.model || status.serial || 'Perangkat';
+    const version = status.androidVersion ? ` · Android ${status.androidVersion}` : '';
+    label.textContent = `${name}${version} · siap`;
     hint.classList.add('hidden');
   } else if (status.state === 'unauthorized') {
     label.textContent = 'Perangkat belum diizinkan';
@@ -6358,6 +6556,9 @@ function renderDevice(status) {
     hint.textContent = 'Sambungkan HP dengan kabel USB dan pastikan USB debugging menyala.';
     hint.classList.remove('hidden');
   }
+  updateActionButtons();
+  renderApks();
+  renderPackages();
 }
 
 function renderApks() {
@@ -6380,7 +6581,7 @@ function renderApks() {
     tbody.appendChild(tr);
   });
   $('install-selected').textContent = `Pasang terpilih (${state.selectedApks.size})`;
-  $('install-selected').disabled = state.selectedApks.size === 0;
+  updateActionButtons();
 }
 
 function addApk(entry) {
@@ -6389,25 +6590,58 @@ function addApk(entry) {
   renderApks();
 }
 
-function renderPackages() {
+// filteredPackages mengembalikan daftar paket yang cocok dengan pencarian.
+function filteredPackages() {
   const term = $('search').value.toLowerCase();
+  return state.packages.filter((p) => p.name.toLowerCase().includes(term));
+}
+
+function detailFor(name) {
+  return state.pkgDetail[name] || null;
+}
+
+function updateSortOptions() {
+  const has = Object.keys(state.pkgDetail).length > 0;
+  $('sort').querySelectorAll('option[value="size"], option[value="date"]')
+    .forEach((o) => { o.disabled = !has; });
+  $('sort-hint').classList.toggle('hidden', has);
+}
+
+function renderPackages() {
   const sortMode = $('sort').value;
+  const hasDetail = Object.keys(state.pkgDetail).length > 0;
+  // Urut ukuran/tanggal butuh detail; sebelum itu jatuh kembali ke urut nama.
+  const mode = (sortMode === 'size' || sortMode === 'date') && !hasDetail ? 'name' : sortMode;
+
   const tbody = $('pkg-table').querySelector('tbody');
   tbody.innerHTML = '';
 
-  let rows = state.packages.filter((p) => p.name.toLowerCase().includes(term));
-  if (!sortMode.startsWith('system')) rows = rows.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const rows = filteredPackages();
+  if (mode === 'name') {
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (mode === 'size') {
+    rows.sort((a, b) => (detailFor(a.name)?.sizeBytes || 0) - (detailFor(b.name)?.sizeBytes || 0));
+  } else if (mode === 'date') {
+    rows.sort((a, b) => (detailFor(a.name)?.installTime || '').localeCompare(detailFor(b.name)?.installTime || ''));
+  }
 
   rows.forEach((pkg) => {
     const tr = document.createElement('tr');
     const locked = pkg.system;
+    const ready = deviceReady();
+    const detail = detailFor(pkg.name);
     tr.innerHTML = `
       <td><input type="checkbox" ${state.selectedPkgs.has(pkg.name) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
       <td>${pkg.name} ${locked ? '<span class="badge">sistem</span>' : ''}</td>
       <td>${pkg.versionCode || '-'}</td>
-      <td>
+      <td>${detail ? humanSize(detail.sizeBytes) : '-'}</td>
+      <td>${detail?.installTime || '-'}</td>
+      <td class="row-actions">
         <button class="secondary" data-act="detail">Detail</button>
-        <button class="danger" data-act="uninstall" ${locked ? 'disabled' : ''}>Copot</button>
+        <button class="danger" data-act="uninstall" ${locked || !ready ? 'disabled' : ''}>Copot</button>
+        <button class="secondary" data-act="uninstall_keep" ${locked || !ready ? 'disabled' : ''}>Copot (simpan data)</button>
+        <button class="secondary" data-act="clear_data" ${!ready ? 'disabled' : ''}>Hapus data</button>
+        <button class="secondary" data-act="pull" ${!ready ? 'disabled' : ''}>Tarik APK</button>
       </td>`;
     tr.querySelector('input').addEventListener('change', (e) => {
       if (e.target.checked) state.selectedPkgs.add(pkg.name); else state.selectedPkgs.delete(pkg.name);
@@ -6415,13 +6649,23 @@ function renderPackages() {
     });
     tr.querySelector('[data-act=detail]').addEventListener('click', () => showDetail(pkg.name));
     tr.querySelector('[data-act=uninstall]').addEventListener('click', () => {
-      if (confirm(`Copot ${pkg.name}?`)) createJobs('uninstall', [pkg.name]);
+      if (confirm(`Copot ${pkg.name}? Tindakan ini menghapus aplikasi dari HP.`)) createJobs('uninstall', [pkg.name]);
+    });
+    tr.querySelector('[data-act=uninstall_keep]').addEventListener('click', () => {
+      if (confirm(`Copot ${pkg.name} tapi simpan datanya?`)) createJobs('uninstall_keep', [pkg.name]);
+    });
+    tr.querySelector('[data-act=clear_data]').addEventListener('click', () => {
+      if (confirm(`Hapus data ${pkg.name}? Aplikasi tetap terpasang.`)) createJobs('clear_data', [pkg.name]);
+    });
+    tr.querySelector('[data-act=pull]').addEventListener('click', () => {
+      if (confirm(`Tarik APK ${pkg.name} ke folder hasil?`)) createJobs('pull', [pkg.name]);
     });
     tbody.appendChild(tr);
   });
 
   $('uninstall-selected').textContent = `Copot terpilih (${state.selectedPkgs.size})`;
   $('uninstall-keep-selected').textContent = `Copot (simpan data) (${state.selectedPkgs.size})`;
+  updateActionButtons();
 }
 
 async function showDetail(name) {
@@ -6446,6 +6690,42 @@ async function showDetail(name) {
   } catch (err) {
     el.textContent = 'Gagal memuat detail: ' + err.message;
   }
+}
+
+// loadDetails memperkaya baris yang terlihat dengan ukuran dan tanggal
+// terpasang, dengan concurrency terbatas (4 sekaligus).
+async function loadDetails() {
+  const targets = filteredPackages().map((p) => p.name).filter((n) => !state.pkgDetail[n]);
+  const btn = $('load-details');
+  if (!targets.length) {
+    toast('Detail sudah dimuat untuk baris yang terlihat');
+    updateSortOptions();
+    return;
+  }
+  btn.disabled = true;
+  const total = targets.length;
+  let done = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < targets.length) {
+      const name = targets[next++];
+      try {
+        state.pkgDetail[name] = await api('/api/packages/detail', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ package: name }),
+        });
+      } catch (e) { /* baris ini tetap tanpa detail */ }
+      done++;
+      btn.textContent = `Muat detail (${done}/${total})`;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, targets.length) }, worker));
+  btn.disabled = false;
+  btn.textContent = 'Muat detail';
+  updateSortOptions();
+  renderPackages();
+  toast(`Detail dimuat untuk ${done} aplikasi`);
 }
 
 function renderJobs() {
@@ -6501,10 +6781,22 @@ async function createJobs(kind, targets) {
 
 async function loadHistory() {
   try {
-    const entries = await api('/api/history?limit=200');
-    const tbody = $('history-table').querySelector('tbody');
-    tbody.innerHTML = '';
-    entries.forEach((e) => {
+    const raw = await api('/api/history?limit=200');
+    state.history = Array.isArray(raw) ? raw : [];
+    renderHistory();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function renderHistory() {
+  const term = ($('history-filter').value || '').toLowerCase();
+  const tbody = $('history-table').querySelector('tbody');
+  tbody.innerHTML = '';
+  state.history
+    .filter((e) => !term || [e.action, e.package, e.detail]
+      .some((f) => (f || '').toLowerCase().includes(term)))
+    .forEach((e) => {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>${new Date(e.time).toLocaleString('id-ID')}</td>
         <td>${e.action}</td><td>${e.package || '-'}</td>
@@ -6512,15 +6804,27 @@ async function loadHistory() {
         <td>${e.detail || ''}</td>`;
       tbody.appendChild(tr);
     });
-  } catch (err) {
-    toast(err.message, true);
-  }
 }
 
 async function loadPackages() {
   try {
-    const system = $('show-system').checked ? '1' : '0';
-    state.packages = await api(`/api/packages?system=${system}`);
+    if (state.pkgFilter === 'all') {
+      // "Semua" menggabungkan pihak ketiga dan sistem, dedup per nama.
+      const [third, system] = await Promise.all([
+        api('/api/packages?system=0'),
+        api('/api/packages?system=1'),
+      ]);
+      const byName = new Map();
+      (Array.isArray(third) ? third : []).forEach((p) => byName.set(p.name, p));
+      (Array.isArray(system) ? system : []).forEach((p) => byName.set(p.name, { ...p, system: true }));
+      state.packages = Array.from(byName.values());
+    } else {
+      const list = await api(`/api/packages?system=${state.pkgFilter === 'system' ? '1' : '0'}`);
+      state.packages = (Array.isArray(list) ? list : []).map((p) => ({
+        ...p,
+        system: state.pkgFilter === 'system',
+      }));
+    }
     renderPackages();
   } catch (err) {
     toast('Gagal memuat daftar aplikasi: ' + err.message, true);
@@ -6573,6 +6877,21 @@ async function uploadFile(file) {
   }
 }
 
+function setupBottomToggle() {
+  const section = document.querySelector('.bottom');
+  const toggle = $('bottom-toggle');
+  const collapsed = localStorage.getItem('adbapp.bottomCollapsed') === '1';
+  section.classList.toggle('collapsed', collapsed);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+
+  toggle.addEventListener('click', () => {
+    const next = !section.classList.contains('collapsed');
+    section.classList.toggle('collapsed', next);
+    toggle.setAttribute('aria-expanded', String(!next));
+    localStorage.setItem('adbapp.bottomCollapsed', next ? '1' : '0');
+  });
+}
+
 function bind() {
   $('refresh').addEventListener('click', () =>
     api('/api/device/refresh', { method: 'POST' }).catch((e) => toast(e.message, true)));
@@ -6580,7 +6899,8 @@ function bind() {
     const folder = $('folder').value.trim();
     if (!folder) { toast('Isi dulu folder koleksi', true); return; }
     try {
-      state.apks = await api(`/api/apks?folder=${encodeURIComponent(folder)}`);
+      const list = await api(`/api/apks?folder=${encodeURIComponent(folder)}`);
+      state.apks = Array.isArray(list) ? list : [];
       renderApks();
       await api('/api/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -6614,9 +6934,17 @@ function bind() {
     }
   });
   $('reload-packages').addEventListener('click', loadPackages);
-  $('show-system').addEventListener('change', loadPackages);
+  $('load-details').addEventListener('click', loadDetails);
+  document.querySelectorAll('.filter').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter').forEach((b) => b.classList.toggle('active', b === btn));
+      state.pkgFilter = btn.dataset.filter;
+      loadPackages();
+    });
+  });
   $('search').addEventListener('input', renderPackages);
   $('sort').addEventListener('change', renderPackages);
+  $('history-filter').addEventListener('input', renderHistory);
   $('export-csv').addEventListener('click', () => { window.location = '/api/history/export?format=csv'; });
   $('export-json').addEventListener('click', () => { window.location = '/api/history/export?format=json'; });
 }
@@ -6624,7 +6952,9 @@ function bind() {
 async function boot() {
   bind();
   setupDropZone();
+  setupBottomToggle();
   connectEvents();
+  updateSortOptions();
   try {
     const snapshot = await api('/api/state');
     renderDevice(snapshot.device);
@@ -6749,7 +7079,9 @@ func run(port int, noOpen bool, dataDir string) error {
 	log.Printf("adb siap: %s", adbPath)
 
 	base := adbx.New(adbPath)
-	monitor := device.New(base)
+	monitor := device.New(base, device.WithVersionGetter(func(ctx context.Context, serial string) (string, error) {
+		return base.WithSerial(serial).Output(ctx, "shell", "getprop", "ro.build.version.release")
+	}))
 	history := store.New(p.HistoryFile)
 
 	targeted := &targetedRunner{base: base, monitor: monitor}

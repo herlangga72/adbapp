@@ -127,7 +127,9 @@ dilipat.
 **Bar atas (selalu terlihat)** — indikator perangkat: titik warna (hijau siap,
 kuning belum diizinkan, merah tidak ada), merek/model, versi Android, tombol
 "Pindai ulang". Bila perangkat belum diizinkan, instruksi singkat muncul di
-sini.
+sini. Versi Android dibaca dari `getprop ro.build.version.release` ketika
+perangkat menjadi siap, lalu di-cache per serial agar tidak ditanyakan ulang
+tiap siklus pemantauan; bila pembacaan gagal, bagian versi dibiarkan kosong.
 
 **Tab "Pasang"** — kotak seret & lepas besar, dua tombol (Folder koleksi,
 Tambah dari URL), daftar APK yang masuk dengan kotak centang, nama berkas,
@@ -136,7 +138,9 @@ package, versi, ukuran, dan tombol "Pasang terpilih (N)".
 **Tab "Terpasang"** — kotak pencarian, filter (Semua / Pihak ketiga / Sistem),
 dan pengurutan (nama, ukuran, tanggal). Tiap baris punya aksi cepat: Copot,
 Copot (simpan data), Hapus data, Tarik APK. Aplikasi sistem ditandai dan tombol
-copotnya nonaktif.
+copotnya nonaktif. Ukuran dan tanggal hanya tersedia lewat pemuatan detail per
+paket (tombol "Muat detail"), jadi pengurutan ukuran/tanggal baru aktif setelah
+detail dimuat; sebelum itu urutan jatuh kembali ke nama.
 
 **Panel bawah "Antrean & Riwayat"** — dua sub-tab: antrean job berjalan dengan
 progress bar dan tombol batalkan, serta riwayat audit dengan filter dan tombol
@@ -155,6 +159,8 @@ singkat berbahasa manusia beserta langkah perbaikannya.
 - Perangkat tidak tersambung → status merah, tombol dinonaktifkan, petunjuk:
   cek kabel, pilih mode *File Transfer*, pastikan USB debugging menyala.
 - Belum diizinkan (*unauthorized*) → instruksi menekan *Allow* di layar HP.
+- Versi Android dibaca dari `getprop`; kegagalan pembacaan tidak muncul sebagai
+  error, bagian versi hanya dikosongkan (pemantauan tetap berjalan).
 - Perangkat tercabut saat job jalan → job ditandai gagal dengan pesan
   "perangkat terputus"; sisa antrean berhenti di `queued`.
 
