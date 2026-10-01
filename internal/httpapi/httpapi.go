@@ -26,6 +26,7 @@ import (
 type DeviceSource interface {
 	Current() device.Status
 	Refresh(ctx context.Context) error
+	Select(serial string) error
 }
 
 type JobQueue interface {
@@ -62,6 +63,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/device/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/device/select", s.handleSelectDevice)
 	mux.HandleFunc("GET /api/apks", s.handleListAPKs)
 	mux.HandleFunc("POST /api/apks/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/apks/url", s.handleFromURL)
@@ -190,6 +192,33 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if err := s.Device.Refresh(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Device.Current())
+}
+
+// handleSelectDevice memilih perangkat aktif ketika lebih dari satu tersambung.
+// Serial yang tidak dikenal dibalas 404; serial kosong dibalas 400.
+func (s *Server) handleSelectDevice(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Serial string `json:"serial"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if strings.TrimSpace(req.Serial) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("serial wajib diisi"))
+		return
+	}
+	if err := s.Device.Select(req.Serial); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	// Pilih ulang sekarang supaya status yang dikembalikan langsung mencerminkan
+	// perangkat yang baru dipilih.
 	if err := s.Device.Refresh(r.Context()); err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return

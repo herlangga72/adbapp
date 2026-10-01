@@ -25,6 +25,7 @@ type apkEntry struct {
 	Package     string `json:"package,omitempty"`
 	VersionName string `json:"versionName,omitempty"`
 	VersionCode int64  `json:"versionCode,omitempty"`
+	MinSDK      int    `json:"minSdk,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
 
@@ -45,6 +46,7 @@ func (s *Server) entryFor(path string) apkEntry {
 	e.Package = meta.Package
 	e.VersionName = meta.VersionName
 	e.VersionCode = meta.VersionCode
+	e.MinSDK = meta.MinSDK
 	return e
 }
 
@@ -125,6 +127,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := s.entryFor(dest)
+	if entry.Error != "" {
+		// Simpan sementara lalu validasi: berkas yang bukan APK yang sah harus
+		// ditolak di sini, sama seperti jalur URL, dan tidak ditinggalkan di
+		// folder unggahan.
+		_ = os.Remove(dest)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("berkas bukan APK yang sah: %s", entry.Error))
+		return
+	}
 	writeJSON(w, http.StatusOK, entry)
 }
 

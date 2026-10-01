@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,10 +26,39 @@ import (
 	"github.com/herlangga72/adbapp/internal/store"
 )
 
-type fakeDevice struct{ status device.Status }
+type fakeDevice struct {
+	status   device.Status
+	selected string
+}
 
-func (f fakeDevice) Current() device.Status            { return f.status }
-func (f fakeDevice) Refresh(ctx context.Context) error { return nil }
+func (f *fakeDevice) Current() device.Status            { return f.status }
+func (f *fakeDevice) Refresh(ctx context.Context) error { return nil }
+
+// Select meniru Monitor.Select: hanya serial yang dikenal yang diterima, lalu
+// perangkat itu dijadikan yang aktif sehingga Current mencerminkannya.
+func (f *fakeDevice) Select(serial string) error {
+	all := append([]string{f.status.Serial}, f.status.Others...)
+	found := false
+	for _, s := range all {
+		if s == serial {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("perangkat %s tidak dikenal", serial)
+	}
+	f.selected = serial
+	f.status.Serial = serial
+	others := []string{}
+	for _, s := range all {
+		if s != serial {
+			others = append(others, s)
+		}
+	}
+	f.status.Others = others
+	return nil
+}
 
 type fakeQueue struct {
 	enqueued     []queue.Job
@@ -84,7 +115,7 @@ func newTestServer(t *testing.T) (*Server, *fakeQueue) {
 	t.Helper()
 	fq := &fakeQueue{}
 	s := &Server{
-		Device:  fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
+		Device:  &fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
 		Queue:   fq,
 		History: &fakeHistory{entries: []store.Entry{{Action: "install", Package: "com.foo", Success: true}}},
 		Adb:     fakeAdb{},
@@ -206,14 +237,19 @@ func TestLocalOnlyRejectsForeignHost(t *testing.T) {
 	}
 }
 
-func TestUploadSavesFile(t *testing.T) {
+func TestUploadSavesValidAPK(t *testing.T) {
 	s, _ := newTestServer(t)
 	if err := s.Paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
 
+	apk := buildAPK(t)
+	content, err := os.ReadFile(apk)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var body bytes.Buffer
-	writeMultipart(t, &body, "file", "contoh.apk", []byte("bukan-apk-sungguhan"))
+	writeMultipart(t, &body, "file", "contoh.apk", content)
 	rec := httptest.NewRecorder()
 	req := localRequest(http.MethodPost, "/api/apks/upload", &body)
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=batas")
@@ -229,6 +265,151 @@ func TestUploadSavesFile(t *testing.T) {
 	want := filepath.Join(s.Paths.UploadsDir, "contoh.apk")
 	if got.Path != want {
 		t.Fatalf("path salah: got %q want %q", got.Path, want)
+	}
+	if got.Package == "" {
+		t.Fatalf("APK sah seharusnya punya package: %+v", got)
+	}
+}
+
+func TestUploadRejectsCorruptAPKAndRemovesFile(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	var body bytes.Buffer
+	writeMultipart(t, &body, "file", "rusak.apk", []byte("bukan-apk-sungguhan"))
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/apks/upload", &body)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=batas")
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d body %s", rec.Code, rec.Body.String())
+	}
+	entries, err := os.ReadDir(s.Paths.UploadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("berkas rusak tidak dibersihkan: %v", entries)
+	}
+}
+
+// moduleManifestBin adalah AndroidManifest.xml biner bawaan modul apkparser;
+// APK uji dibangun saat berjalan, bukan disalin ke repo.
+const moduleManifestBin = "98d2e837b8f3ac41e74b86b2d532972955e5352197a893206ecd9650f678ae31.bin"
+
+// buildAPK membangun APK sementara dari testdata modul apkparser. Tes di-skip
+// bila modul atau testdata-nya tidak tersedia.
+func buildAPK(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/avast/apkparser").Output()
+	if err != nil {
+		t.Skipf("modul apkparser tidak tersedia: %v", err)
+	}
+	binPath := filepath.Join(strings.TrimSpace(string(out)), "testdata", moduleManifestBin)
+	data, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Skipf("testdata modul apkparser tidak tersedia: %v", err)
+	}
+
+	apkPath := filepath.Join(t.TempDir(), "valid.apk")
+	f, err := os.Create(apkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("AndroidManifest.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return apkPath
+}
+
+func TestListAPKsExposesMinSdk(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	folder := t.TempDir()
+	src := buildAPK(t)
+	content, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "satu.apk"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/apks?folder="+folder, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	}
+	var entries []apkEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("harus 1 entri, dapat %d", len(entries))
+	}
+	if entries[0].MinSDK == 0 {
+		t.Fatalf("minSdk tidak terekspos: %+v", entries[0])
+	}
+	if entries[0].Package == "" {
+		t.Fatalf("package tidak terekspos: %+v", entries[0])
+	}
+}
+
+func TestSelectDeviceHappyPath(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.Device.(*fakeDevice).status.Others = []string{"S2"}
+
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/device/select", strings.NewReader(`{"serial":"S2"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	}
+	var got device.Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	if got.Serial != "S2" {
+		t.Fatalf("serial hasil = %q, mau S2", got.Serial)
+	}
+}
+
+func TestSelectDeviceUnknownSerial(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/device/select", strings.NewReader(`{"serial":"tidak-ada"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("harus 404, dapat %d body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSelectDeviceEmptySerial(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := localRequest(http.MethodPost, "/api/device/select", strings.NewReader(`{"serial":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("harus 400, dapat %d body %s", rec.Code, rec.Body.String())
 	}
 }
 
