@@ -3162,7 +3162,7 @@ type Status struct {
 	State          State    `json:"state"`
 	Serial         string   `json:"serial"`
 	Model          string   `json:"model"`
-	AndroidVersion string   `json:"androidVersion,omitempty"`
+	AndroidVersion string   `json:"androidVersion"`
 	Others         []string `json:"others,omitempty"`
 }
 
