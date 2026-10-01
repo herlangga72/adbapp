@@ -3,6 +3,8 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -157,5 +159,209 @@ func TestLoadConfigMissingFileReturnsDefault(t *testing.T) {
 	}
 	if cfg.ApkFolder != "" {
 		t.Fatalf("default harus kosong: %+v", cfg)
+	}
+}
+
+func TestLoadConfigCorruptReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{ini bukan json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("config.json rusak seharusnya mengembalikan error")
+	}
+}
+
+func TestSaveConfigReplacesAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := SaveConfig(path, Config{ApkFolder: "/lama"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfig(path, Config{ApkFolder: "/baru"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ApkFolder != "/baru" {
+		t.Fatalf("nilai baru tidak menimpa: %+v", got)
+	}
+	// Tidak boleh ada berkas sementara yang tertinggal.
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), "config.json.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("berkas sementara tertinggal: %v", matches)
+	}
+}
+
+func TestAppendDefaultsZeroTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	before := time.Now()
+	if err := s.Append(Entry{Package: "pkg"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("harus 1 entri, dapat %d", len(got))
+	}
+	if got[0].Time.IsZero() {
+		t.Fatal("Time nol seharusnya diisi waktu sekarang")
+	}
+	if got[0].Time.Before(before.Add(-time.Second)) || got[0].Time.After(time.Now().Add(time.Second)) {
+		t.Fatalf("Time tidak wajar: %v (sekarang %v)", got[0].Time, time.Now())
+	}
+}
+
+func TestExportJSONEmptyIsArray(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	var buf bytes.Buffer
+	if err := s.ExportJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(buf.String()) != "[]" {
+		t.Fatalf("ekspor kosong harus [] bukan null: %q", buf.String())
+	}
+}
+
+func TestReadMissingFileReturnsNil(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "tidak-ada.jsonl"))
+	got, err := s.Read(5)
+	if err != nil {
+		t.Fatalf("berkas hilang seharusnya tidak error: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("berkas hilang harus nil: %+v", got)
+	}
+}
+
+func TestReadTailEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New(path).Read(5)
+	if err != nil {
+		t.Fatalf("berkas kosong tidak boleh error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("berkas kosong harus kosong: %+v", got)
+	}
+}
+
+func TestReadTailLimitOnSmallFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	base := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		if err := s.Append(Entry{
+			Time:    base.Add(time.Duration(i) * time.Minute),
+			Package: fmt.Sprintf("pkg-%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		limit int
+		want  []string
+	}{
+		{1, []string{"pkg-4"}},
+		{2, []string{"pkg-4", "pkg-3"}},
+		{5, []string{"pkg-4", "pkg-3", "pkg-2", "pkg-1", "pkg-0"}},
+		{9, []string{"pkg-4", "pkg-3", "pkg-2", "pkg-1", "pkg-0"}},
+	}
+	for _, tc := range cases {
+		got, err := s.Read(tc.limit)
+		if err != nil {
+			t.Fatalf("Read(%d) gagal: %v", tc.limit, err)
+		}
+		if len(got) != len(tc.want) {
+			t.Fatalf("Read(%d) dapat %d entri, mau %d: %+v", tc.limit, len(got), len(tc.want), got)
+		}
+		for i := range tc.want {
+			if got[i].Package != tc.want[i] {
+				t.Fatalf("Read(%d) urutan salah di %d: got %q mau %q", tc.limit, i, got[i].Package, tc.want[i])
+			}
+		}
+	}
+}
+
+func TestReadTailLastThreeOfLargeHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 2000; i++ {
+		if err := s.Append(Entry{Package: fmt.Sprintf("pkg-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Read(3)
+	if err != nil {
+		t.Fatalf("Read gagal: %v", err)
+	}
+	want := []string{"pkg-1999", "pkg-1998", "pkg-1997"}
+	if len(got) != len(want) {
+		t.Fatalf("harus 3 entri, dapat %d: %+v", len(got), got)
+	}
+	for i := range want {
+		if got[i].Package != want[i] {
+			t.Fatalf("urutan salah di %d: got %q mau %q", i, got[i].Package, want[i])
+		}
+	}
+}
+
+func TestReadTailNoTrailingNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	e1, err := json.Marshal(Entry{Package: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := json.Marshal(Entry{Package: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Baris terakhir sengaja tanpa newline penutup.
+	if err := appendRaw(path, string(e1)+"\n"+string(e2)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Package != "b" {
+		t.Fatalf("baris terakhir tanpa newline salah: %+v", got)
+	}
+}
+
+func TestReadTailLineLongerThanChunk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	big := strings.Repeat("x", 200*1024)
+	if err := s.Append(Entry{Package: "big", Detail: big}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(Entry{Package: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Package != "small" {
+		t.Fatalf("entri terakhir salah: %+v", got)
+	}
+	got, err = s.Read(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Package != "big" || got[1].Detail != big {
+		t.Fatalf("baris panjang tidak terbaca utuh: len=%d", len(got))
 	}
 }

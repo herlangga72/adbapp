@@ -92,6 +92,10 @@ var (
 	cache   = map[string]cachedMeta{}
 )
 
+// cacheMaxEntries membatasi jumlah entri cache agar tidak tumbuh tanpa batas
+// saat daftar APK terus berubah.
+const cacheMaxEntries = 512
+
 type cachedMeta struct {
 	size int64
 	mod  int64
@@ -114,6 +118,9 @@ func ReadCached(path string, size, modUnixNano int64) (Meta, error) {
 	}
 
 	cacheMu.Lock()
+	if len(cache) >= cacheMaxEntries {
+		cache = map[string]cachedMeta{}
+	}
 	cache[path] = cachedMeta{size: size, mod: modUnixNano, meta: m}
 	cacheMu.Unlock()
 	return m, nil

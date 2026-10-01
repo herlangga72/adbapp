@@ -3178,10 +3178,60 @@ Create `internal/apkmeta/apkmeta_test.go`:
 package apkmeta
 
 import (
+	"archive/zip"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// moduleManifestBin adalah AndroidManifest.xml biner bawaan modul apkparser.
+// Berkas ini tidak disalin ke repo; tes membangun APK sementara saat berjalan.
+const moduleManifestBin = "98d2e837b8f3ac41e74b86b2d532972955e5352197a893206ecd9650f678ae31.bin"
+
+// buildModuleAPK membangun berkas APK sementara dari testdata biner modul
+// apkparser. Tes di-skip bila modul atau testdata-nya tidak tersedia.
+func buildModuleAPK(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/avast/apkparser").Output()
+	if err != nil {
+		t.Skipf("modul apkparser tidak tersedia: %v", err)
+	}
+	binPath := filepath.Join(strings.TrimSpace(string(out)), "testdata", moduleManifestBin)
+	data, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Skipf("testdata modul apkparser tidak tersedia: %v", err)
+	}
+
+	apkPath := filepath.Join(t.TempDir(), "mini.apk")
+	f, err := os.Create(apkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("AndroidManifest.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return apkPath
+}
+
+func resetCache() {
+	cacheMu.Lock()
+	cache = map[string]cachedMeta{}
+	cacheMu.Unlock()
+}
 
 // fixtureAPK membangun APK minimal: arsip zip berisi AndroidManifest.xml
 // biner. Berkas dibuat sekali di TestMain agar tidak perlu biner besar
@@ -3210,6 +3260,79 @@ func TestReadRejectsNonAPK(t *testing.T) {
 	}
 	if _, err := Read(path); err == nil {
 		t.Fatal("seharusnya error untuk berkas bukan APK")
+	}
+}
+
+// TestReadRealManifestFromModule menjalankan jalur parse APK sungguhan di CI
+// tanpa mengomit APK milik siapa pun: APK dibangun saat tes dari manifest
+// biner bawaan modul apkparser.
+func TestReadRealManifestFromModule(t *testing.T) {
+	apk := buildModuleAPK(t)
+	got, err := Read(apk)
+	if err != nil {
+		t.Fatalf("Read APK asli gagal: %v", err)
+	}
+	if got.Package != "name.tbx.erndy" {
+		t.Fatalf("package salah: %q", got.Package)
+	}
+	if got.VersionName != "1.3" {
+		t.Fatalf("versionName salah: %q", got.VersionName)
+	}
+	if got.VersionCode != 4 {
+		t.Fatalf("versionCode salah: %d", got.VersionCode)
+	}
+	if got.MinSDK != 4 {
+		t.Fatalf("minSdk salah: %d", got.MinSDK)
+	}
+}
+
+// TestReadCachedStaleness memastikan cache tidak dipakai saat size/mtime
+// berubah: pemanggilan kedua harus membaca ulang, sehingga berkas yang bukan
+// APK memunculkan error alih-alih mengembalikan entri basi.
+func TestReadCachedStaleness(t *testing.T) {
+	t.Cleanup(resetCache)
+	path := filepath.Join(t.TempDir(), "hilang.apk")
+
+	// Isi cache secara putih untuk path ini, meniru hasil baca sebelumnya.
+	cacheMu.Lock()
+	cache[path] = cachedMeta{size: 1, mod: 1, meta: Meta{Package: "basi"}}
+	cacheMu.Unlock()
+
+	got, err := ReadCached(path, 2, 2)
+	if err == nil {
+		t.Fatalf("stat berubah seharusnya memicu baca ulang: %+v", got)
+	}
+}
+
+// TestReadCachedBounds memastikan cache tetap terbatas saat terus diisi.
+func TestReadCachedBounds(t *testing.T) {
+	t.Cleanup(resetCache)
+	apk := buildModuleAPK(t)
+
+	cacheMu.Lock()
+	for i := 0; i < cacheMaxEntries; i++ {
+		cache[fmt.Sprintf("/dummy/%d.apk", i)] = cachedMeta{size: 1, mod: 1}
+	}
+	cacheMu.Unlock()
+
+	m, err := ReadCached(apk, 10, 20)
+	if err != nil {
+		t.Fatalf("ReadCached gagal: %v", err)
+	}
+	cacheMu.Lock()
+	size := len(cache)
+	cacheMu.Unlock()
+	if size > cacheMaxEntries {
+		t.Fatalf("cache melebihi batas: %d > %d", size, cacheMaxEntries)
+	}
+
+	// Lookup ulang untuk stat yang sama harus tetap bekerja.
+	got, err := ReadCached(apk, 10, 20)
+	if err != nil {
+		t.Fatalf("ReadCached ulang gagal: %v", err)
+	}
+	if got != m {
+		t.Fatalf("hasil cache tidak konsisten: %+v vs %+v", got, m)
 	}
 }
 ```
@@ -3318,6 +3441,10 @@ var (
 	cache   = map[string]cachedMeta{}
 )
 
+// cacheMaxEntries membatasi jumlah entri cache agar tidak tumbuh tanpa batas
+// saat daftar APK terus berubah.
+const cacheMaxEntries = 512
+
 type cachedMeta struct {
 	size int64
 	mod  int64
@@ -3340,6 +3467,9 @@ func ReadCached(path string, size, modUnixNano int64) (Meta, error) {
 	}
 
 	cacheMu.Lock()
+	if len(cache) >= cacheMaxEntries {
+		cache = map[string]cachedMeta{}
+	}
 	cache[path] = cachedMeta{size: size, mod: modUnixNano, meta: m}
 	cacheMu.Unlock()
 	return m, nil
@@ -3391,6 +3521,8 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -3547,6 +3679,210 @@ func TestLoadConfigMissingFileReturnsDefault(t *testing.T) {
 		t.Fatalf("default harus kosong: %+v", cfg)
 	}
 }
+
+func TestLoadConfigCorruptReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{ini bukan json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("config.json rusak seharusnya mengembalikan error")
+	}
+}
+
+func TestSaveConfigReplacesAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := SaveConfig(path, Config{ApkFolder: "/lama"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfig(path, Config{ApkFolder: "/baru"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ApkFolder != "/baru" {
+		t.Fatalf("nilai baru tidak menimpa: %+v", got)
+	}
+	// Tidak boleh ada berkas sementara yang tertinggal.
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), "config.json.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("berkas sementara tertinggal: %v", matches)
+	}
+}
+
+func TestAppendDefaultsZeroTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	before := time.Now()
+	if err := s.Append(Entry{Package: "pkg"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("harus 1 entri, dapat %d", len(got))
+	}
+	if got[0].Time.IsZero() {
+		t.Fatal("Time nol seharusnya diisi waktu sekarang")
+	}
+	if got[0].Time.Before(before.Add(-time.Second)) || got[0].Time.After(time.Now().Add(time.Second)) {
+		t.Fatalf("Time tidak wajar: %v (sekarang %v)", got[0].Time, time.Now())
+	}
+}
+
+func TestExportJSONEmptyIsArray(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	var buf bytes.Buffer
+	if err := s.ExportJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(buf.String()) != "[]" {
+		t.Fatalf("ekspor kosong harus [] bukan null: %q", buf.String())
+	}
+}
+
+func TestReadMissingFileReturnsNil(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "tidak-ada.jsonl"))
+	got, err := s.Read(5)
+	if err != nil {
+		t.Fatalf("berkas hilang seharusnya tidak error: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("berkas hilang harus nil: %+v", got)
+	}
+}
+
+func TestReadTailEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New(path).Read(5)
+	if err != nil {
+		t.Fatalf("berkas kosong tidak boleh error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("berkas kosong harus kosong: %+v", got)
+	}
+}
+
+func TestReadTailLimitOnSmallFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	base := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		if err := s.Append(Entry{
+			Time:    base.Add(time.Duration(i) * time.Minute),
+			Package: fmt.Sprintf("pkg-%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		limit int
+		want  []string
+	}{
+		{1, []string{"pkg-4"}},
+		{2, []string{"pkg-4", "pkg-3"}},
+		{5, []string{"pkg-4", "pkg-3", "pkg-2", "pkg-1", "pkg-0"}},
+		{9, []string{"pkg-4", "pkg-3", "pkg-2", "pkg-1", "pkg-0"}},
+	}
+	for _, tc := range cases {
+		got, err := s.Read(tc.limit)
+		if err != nil {
+			t.Fatalf("Read(%d) gagal: %v", tc.limit, err)
+		}
+		if len(got) != len(tc.want) {
+			t.Fatalf("Read(%d) dapat %d entri, mau %d: %+v", tc.limit, len(got), len(tc.want), got)
+		}
+		for i := range tc.want {
+			if got[i].Package != tc.want[i] {
+				t.Fatalf("Read(%d) urutan salah di %d: got %q mau %q", tc.limit, i, got[i].Package, tc.want[i])
+			}
+		}
+	}
+}
+
+func TestReadTailLastThreeOfLargeHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	for i := 0; i < 2000; i++ {
+		if err := s.Append(Entry{Package: fmt.Sprintf("pkg-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Read(3)
+	if err != nil {
+		t.Fatalf("Read gagal: %v", err)
+	}
+	want := []string{"pkg-1999", "pkg-1998", "pkg-1997"}
+	if len(got) != len(want) {
+		t.Fatalf("harus 3 entri, dapat %d: %+v", len(got), got)
+	}
+	for i := range want {
+		if got[i].Package != want[i] {
+			t.Fatalf("urutan salah di %d: got %q mau %q", i, got[i].Package, want[i])
+		}
+	}
+}
+
+func TestReadTailNoTrailingNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	e1, err := json.Marshal(Entry{Package: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := json.Marshal(Entry{Package: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Baris terakhir sengaja tanpa newline penutup.
+	if err := appendRaw(path, string(e1)+"\n"+string(e2)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Package != "b" {
+		t.Fatalf("baris terakhir tanpa newline salah: %+v", got)
+	}
+}
+
+func TestReadTailLineLongerThanChunk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s := New(path)
+	big := strings.Repeat("x", 200*1024)
+	if err := s.Append(Entry{Package: "big", Detail: big}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(Entry{Package: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Package != "small" {
+		t.Fatalf("entri terakhir salah: %+v", got)
+	}
+	got, err = s.Read(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Package != "big" || got[1].Detail != big {
+		t.Fatalf("baris panjang tidak terbaca utuh: len=%d", len(got))
+	}
+}
 ```
 
 - [ ] **Step 2: Jalankan tes, pastikan gagal**
@@ -3564,15 +3900,20 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 )
+
+// newline adalah pemisah satu entri JSON Lines.
+var newline = []byte{'\n'}
 
 // Entry adalah satu baris riwayat audit.
 type Entry struct {
@@ -3618,6 +3959,10 @@ func (s *Store) Append(e Entry) error {
 }
 
 // Read mengembalikan paling banyak limit entri, terbaru lebih dulu.
+//
+// Bila limit > 0, hanya ekor berkas yang dibaca sehingga biaya baca tidak
+// bergantung pada panjang riwayat. Limit <= 0 membaca seluruh berkas, dipakai
+// oleh ekspor CSV/JSON.
 func (s *Store) Read(limit int) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3630,6 +3975,10 @@ func (s *Store) Read(limit int) ([]Entry, error) {
 		return nil, err
 	}
 	defer f.Close()
+
+	if limit > 0 {
+		return readTail(f, limit)
+	}
 
 	var all []Entry
 	scanner := bufio.NewScanner(f)
@@ -3653,10 +4002,83 @@ func (s *Store) Read(limit int) ([]Entry, error) {
 	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
 		all[i], all[j] = all[j], all[i]
 	}
-	if limit > 0 && len(all) > limit {
-		all = all[:limit]
-	}
 	return all, nil
+}
+
+// tailChunkSize adalah ukuran tiap potongan saat membaca mundur dari ekor.
+const tailChunkSize = 64 * 1024
+
+// readTail membaca paling banyak limit baris terakhir berkas dan
+// mengembalikannya terbaru lebih dulu. Baris yang lebih panjang dari
+// tailChunkSize tetap utuh karena potongan terus dibaca sampai baris lengkap
+// terkumpul.
+func readTail(f *os.File, limit int) ([]Entry, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	if size == 0 {
+		return nil, nil
+	}
+
+	// Baca mundur dalam potongan sampai cukup banyak pemisah baris terkumpul
+	// (atau sampai awal berkas). Satu pemisah ekstra memastikan baris terdepan
+	// yang dipertahankan berada tepat setelah newline, jadi utuh meskipun
+	// potongan pertama dimulai di tengah baris. Potongan disimpan lalu
+	// disatukan sekali agar tidak menyalin buffer berulang kali.
+	var chunks [][]byte
+	newlines := 0
+	for pos := size; pos > 0 && newlines < limit+1; {
+		n := int64(tailChunkSize)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		chunk := make([]byte, n)
+		if _, err := f.ReadAt(chunk, pos); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+		newlines += bytes.Count(chunk, newline)
+	}
+
+	total := 0
+	for _, c := range chunks {
+		total += len(c)
+	}
+	buf := make([]byte, 0, total)
+	for i := len(chunks) - 1; i >= 0; i-- {
+		buf = append(buf, chunks[i]...)
+	}
+
+	lines := bytes.Split(buf, newline)
+	// Buang segmen kosong setelah newline terakhir, bila ada.
+	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
+		lines = lines[:len(lines)-1]
+	}
+	// Potongan pertama bisa dimulai di tengah baris; ambil hanya limit baris
+	// terakhir yang pasti utuh.
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+
+	var entries []Entry
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		var e Entry
+		if err := json.Unmarshal(line, &e); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	// Balik urutan: terbaru lebih dulu.
+	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+		entries[i], entries[j] = entries[j], entries[i]
+	}
+	return entries, nil
 }
 
 // ExportCSV menulis seluruh riwayat sebagai CSV.
@@ -3731,13 +4153,41 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// SaveConfig menulis konfigurasi ke disk.
+// SaveConfig menulis konfigurasi ke disk secara atomik: tulis ke berkas
+// sementara di direktori yang sama, sync, lalu rename menimpa target. Dengan
+// begitu crash atau disk penuh tidak meninggalkan config.json yang rusak.
 func SaveConfig(path string, cfg Config) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
+	data = append(data, '\n')
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("membuat berkas sementara untuk %s: %w", path, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menulis %s: %w", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("menyinkronkan %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("menutup berkas sementara %s: %w", tmpName, err)
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return fmt.Errorf("mengatur mode %s: %w", path, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("memindahkan %s ke %s: %w", tmpName, path, err)
+	}
+	return nil
 }
 ```
 
