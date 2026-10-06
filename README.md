@@ -7,6 +7,13 @@ perangkat fisik.
 Satu biner, tanpa perlu memasang Go/Node/Python di komputer pengguna. `adb`
 sudah ditanam di dalam aplikasi.
 
+## Tampilan
+
+Tab **Pasang** menerima berkas APK lewat seret-lepas, folder koleksi, atau URL,
+dan menampilkan identitas APK sebelum dipasang.
+
+![Tab Pasang adbapp](docs/images/tampilan-pasang.png)
+
 ## Menjalankan
 
 Tiga langkah di HP: nyalakan **Opsi Pengembang**, aktifkan **USB debugging**,
