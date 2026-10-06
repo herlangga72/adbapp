@@ -61,13 +61,17 @@ func (f *fakeDevice) Select(serial string) error {
 }
 
 type fakeQueue struct {
-	enqueued     []queue.Job
 	unsubOnce    sync.Once
 	unsubscribed chan struct{}
+	mu           sync.Mutex
+	enqueued     []queue.Job
+	unsubCount   int
 }
 
 func (f *fakeQueue) Enqueue(j queue.Job) queue.Job {
+	f.mu.Lock()
 	f.enqueued = append(f.enqueued, j)
+	f.mu.Unlock()
 	j.ID = "job-1"
 	j.Status = queue.StatusQueued
 	return j
@@ -76,13 +80,21 @@ func (f *fakeQueue) Jobs() []queue.Job      { return nil }
 func (f *fakeQueue) Cancel(id string) error { return nil }
 func (f *fakeQueue) Subscribe() (<-chan queue.Job, func()) {
 	ch := make(chan queue.Job)
-	if f.unsubscribed == nil {
-		f.unsubscribed = make(chan struct{})
-	}
 	return ch, func() {
 		close(ch)
+		f.mu.Lock()
+		f.unsubCount++
+		f.mu.Unlock()
 		f.unsubOnce.Do(func() { close(f.unsubscribed) })
 	}
+}
+
+// unsubscribes mengembalikan jumlah pemanggilan fungsi berhenti-langganan yang
+// sudah terjadi.
+func (f *fakeQueue) unsubscribes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.unsubCount
 }
 
 type fakeHistory struct {
@@ -113,7 +125,7 @@ func (fakeAdb) PackageInfo(ctx context.Context, pkg string) (adbx.PackageInfo, e
 
 func newTestServer(t *testing.T) (*Server, *fakeQueue) {
 	t.Helper()
-	fq := &fakeQueue{}
+	fq := &fakeQueue{unsubscribed: make(chan struct{})}
 	s := &Server{
 		Device:  &fakeDevice{status: device.Status{State: device.StateReady, Serial: "S1", Model: "Pixel"}},
 		Queue:   fq,
@@ -713,6 +725,56 @@ func TestEventsEmitsStateWhenDeviceChanges(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatal("perubahan status tidak dikirim lewat SSE")
+		}
+	}
+}
+
+// TestEventsManyConnectionsUnsubscribe memastikan setiap koneksi SSE yang
+// dibatalkan benar-benar berhenti berlangganan, sehingga koneksi yang dibuka
+// dan ditutup berkali-kali tidak menumpuk langganan di antrean.
+func TestEventsManyConnectionsUnsubscribe(t *testing.T) {
+	old := ssePollInterval
+	ssePollInterval = 10 * time.Millisecond
+	defer func() { ssePollInterval = old }()
+
+	s, fq := newTestServer(t)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	const n = 25
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+			if err != nil {
+				t.Errorf("buat permintaan: %v", err)
+				return
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Errorf("sambung SSE: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+			frames := sseFrames(resp.Body)
+			if _, ok := <-frames; !ok {
+				t.Errorf("tidak ada bingkai pembuka")
+			}
+			cancel()
+		}()
+	}
+	wg.Wait()
+
+	deadline := time.After(5 * time.Second)
+	for fq.unsubscribes() < n {
+		select {
+		case <-deadline:
+			t.Fatalf("hanya %d dari %d koneksi berhenti berlangganan", fq.unsubscribes(), n)
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }

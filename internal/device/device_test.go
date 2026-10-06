@@ -2,7 +2,10 @@ package device
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -349,4 +352,38 @@ func TestLoopZeroIntervalDoesNotPanic(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Loop tidak berhenti setelah ctx dibatalkan")
 	}
+}
+
+// TestMonitorConcurrentRefreshAndRead menjalankan Loop (Refresh berkala) dan
+// pembacaan status dari banyak goroutine sekaligus. Pembacaan meniru handler
+// SSE yang melakukan Marshal dan pembandingan DeepEqual atas Current(), supaya
+// pola pemakaian nyata ikut teruji di bawah -race.
+func TestMonitorConcurrentRefreshAndRead(t *testing.T) {
+	m := New(fakeLister{devices: []adbx.Device{
+		{Serial: "S1", State: "device", Model: "Pixel"},
+		{Serial: "S2", State: "device", Model: "Nexus"},
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Loop(ctx, time.Millisecond)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				st := m.Current()
+				if _, err := json.Marshal(st); err != nil {
+					t.Errorf("marshal status: %v", err)
+					return
+				}
+				if !reflect.DeepEqual(st, st) {
+					t.Errorf("DeepEqual tidak refleksif: %+v", st)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
