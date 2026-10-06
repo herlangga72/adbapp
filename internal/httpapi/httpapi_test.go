@@ -371,6 +371,50 @@ func TestListAPKsExposesMinSdk(t *testing.T) {
 	}
 }
 
+// TestListAPKsParallelKeepsOrderAndEntries memastikan pemrosesan paralel tidak
+// mengubah urutan hasil maupun kelengkapan tiap entri.
+func TestListAPKsParallelKeepsOrderAndEntries(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	folder := t.TempDir()
+	content, err := os.ReadFile(buildAPK(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 17
+	names := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("apk-%02d.apk", i)
+		if err := os.WriteFile(filepath.Join(folder, name), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/apks?folder="+folder, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	}
+	var entries []apkEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	if len(entries) != n {
+		t.Fatalf("harus %d entri, dapat %d", n, len(entries))
+	}
+	for i, e := range entries {
+		if e.Name != names[i] {
+			t.Fatalf("urutan tidak terjaga di %d: dapat %q, mau %q", i, e.Name, names[i])
+		}
+		if e.Package == "" || e.Error != "" {
+			t.Fatalf("entri %q tidak lengkap: %+v", e.Name, e)
+		}
+	}
+}
+
 func TestSelectDeviceHappyPath(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.Device.(*fakeDevice).status.Others = []string{"S2"}
@@ -481,6 +525,31 @@ func TestEventsStreamsStateThenReturnsOnCancel(t *testing.T) {
 	}
 }
 
+// sseFrames membaca aliran SSE dan mengirim setiap bingkai (tanpa baris kosong
+// pemisah) ke kanal. Kanal ditutup ketika aliran berakhir.
+func sseFrames(body io.Reader) <-chan string {
+	frames := make(chan string, 32)
+	go func() {
+		defer close(frames)
+		reader := bufio.NewReader(body)
+		for {
+			var frame strings.Builder
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if line == "\n" {
+					frames <- frame.String()
+					break
+				}
+				frame.WriteString(line)
+			}
+		}
+	}()
+	return frames
+}
+
 // TestEventsStateNotResentWhenUnchanged memastikan bingkai state hanya dikirim
 // saat status perangkat benar-benar berubah. Tanpa ini, klien membangun ulang
 // tabelnya setiap interval poll walau tidak ada yang baru.
@@ -505,26 +574,7 @@ func TestEventsStateNotResentWhenUnchanged(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	frames := make(chan string, 32)
-	go func() {
-		reader := bufio.NewReader(resp.Body)
-		for {
-			var frame strings.Builder
-			for {
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					close(frames)
-					return
-				}
-				if line == "\n" {
-					frames <- frame.String()
-					break
-				}
-				frame.WriteString(line)
-			}
-		}
-	}()
-
+	frames := sseFrames(resp.Body)
 	first, ok := <-frames
 	if !ok {
 		t.Fatal("aliran ditutup sebelum bingkai pertama")
@@ -539,6 +589,88 @@ func TestEventsStateNotResentWhenUnchanged(t *testing.T) {
 	case f := <-frames:
 		t.Fatalf("state dikirim ulang meski tidak berubah: %q", f)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// mutableDevice adalah DeviceSource yang statusnya dapat diubah dari pengujian
+// secara aman terhadap race, supaya jalur "status berubah -> SSE terkirim"
+// benar-benar dapat diuji.
+type mutableDevice struct {
+	mu     sync.Mutex
+	status device.Status
+}
+
+func (m *mutableDevice) Current() device.Status {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.status
+}
+
+func (m *mutableDevice) Refresh(context.Context) error { return nil }
+
+func (m *mutableDevice) Select(serial string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.status.Serial = serial
+	m.status.State = device.StateReady
+	return nil
+}
+
+func (m *mutableDevice) set(st device.Status) {
+	m.mu.Lock()
+	m.status = st
+	m.mu.Unlock()
+}
+
+// TestEventsEmitsStateWhenDeviceChanges memastikan perubahan status perangkat
+// tetap terkirim meski bingkai identik ditahan.
+func TestEventsEmitsStateWhenDeviceChanges(t *testing.T) {
+	old := ssePollInterval
+	ssePollInterval = 15 * time.Millisecond
+	defer func() { ssePollInterval = old }()
+
+	s, _ := newTestServer(t)
+	md := &mutableDevice{status: device.Status{State: device.StateNone}}
+	s.Device = md
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	frames := sseFrames(resp.Body)
+	first, ok := <-frames
+	if !ok {
+		t.Fatal("aliran ditutup sebelum bingkai pertama")
+	}
+	if !strings.Contains(first, "event: state") {
+		t.Fatalf("bingkai pertama bukan state: %q", first)
+	}
+
+	md.set(device.Status{State: device.StateReady, Serial: "S9", Model: "Baru"})
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatal("aliran ditutup sebelum perubahan terkirim")
+			}
+			if strings.Contains(f, "S9") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("perubahan status tidak dikirim lewat SSE")
+		}
 	}
 }
 
