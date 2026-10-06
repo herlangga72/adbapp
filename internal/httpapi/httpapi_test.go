@@ -481,6 +481,67 @@ func TestEventsStreamsStateThenReturnsOnCancel(t *testing.T) {
 	}
 }
 
+// TestEventsStateNotResentWhenUnchanged memastikan bingkai state hanya dikirim
+// saat status perangkat benar-benar berubah. Tanpa ini, klien membangun ulang
+// tabelnya setiap interval poll walau tidak ada yang baru.
+func TestEventsStateNotResentWhenUnchanged(t *testing.T) {
+	old := ssePollInterval
+	ssePollInterval = 15 * time.Millisecond
+	defer func() { ssePollInterval = old }()
+
+	s, _ := newTestServer(t)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	frames := make(chan string, 32)
+	go func() {
+		reader := bufio.NewReader(resp.Body)
+		for {
+			var frame strings.Builder
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					close(frames)
+					return
+				}
+				if line == "\n" {
+					frames <- frame.String()
+					break
+				}
+				frame.WriteString(line)
+			}
+		}
+	}()
+
+	first, ok := <-frames
+	if !ok {
+		t.Fatal("aliran ditutup sebelum bingkai pertama")
+	}
+	if !strings.Contains(first, "event: state") {
+		t.Fatalf("bingkai pertama bukan state: %q", first)
+	}
+
+	// Selama status tidak berubah, poll boleh berjalan berkali-kali tetapi tidak
+	// boleh menghasilkan bingkai state kedua.
+	select {
+	case f := <-frames:
+		t.Fatalf("state dikirim ulang meski tidak berubah: %q", f)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 func TestCrossSiteGuard(t *testing.T) {
 	const body = `{"kind":"uninstall","targets":["com.a"]}`
 	cases := []struct {

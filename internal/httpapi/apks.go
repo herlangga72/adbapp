@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/herlangga72/adbapp/internal/apkmeta"
@@ -71,16 +72,36 @@ func (s *Server) handleListAPKs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries := make([]apkEntry, 0, len(dirents))
+	var paths []string
 	for _, de := range dirents {
 		if de.IsDir() || !strings.EqualFold(filepath.Ext(de.Name()), ".apk") {
 			continue
 		}
-		entries = append(entries, s.entryFor(filepath.Join(folder, de.Name())))
+		paths = append(paths, filepath.Join(folder, de.Name()))
 	}
+
+	// Membaca identitas setiap APK adalah kerja CPU+IO per berkas. Untuk folder
+	// koleksi yang besar, memprosesnya berurutan membuat respons menunggu lama;
+	// batasi paralelisme agar disk tidak dibanjiri sekaligus.
+	entries := make([]apkEntry, len(paths))
+	sem := make(chan struct{}, apkListWorkers)
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, p string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			entries[i] = s.entryFor(p)
+		}(i, p)
+	}
+	wg.Wait()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	writeJSON(w, http.StatusOK, entries)
 }
+
+// apkListWorkers membatasi jumlah APK yang diurai bersamaan saat memuat folder.
+const apkListWorkers = 8
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxAPKSize)
@@ -193,7 +214,12 @@ func (s *Server) handleFromURL(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.entryFor(dest))
+	// Identitas APK sudah dibaca dari berkas .part; pakai ulang alih-alih
+	// mengurai ulang seluruh APK hanya karena path-nya berubah.
+	final := entry
+	final.Path = dest
+	final.Name = filepath.Base(dest)
+	writeJSON(w, http.StatusOK, final)
 }
 
 // downloadAPK mengunduh url ke path dengan batas waktu, batas ukuran, dan

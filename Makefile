@@ -49,8 +49,12 @@ vet:
 fmt:
 	gofmt -l -w .
 
+# Sama dengan langkah build di .github/workflows/release.yml: -trimpath
+# menghapus jalur build lokal, sedangkan -ldflags "-s -w" membuang tabel
+# simbol dan info debug. Ini memangkas ukuran biner sekitar 20% tanpa
+# mengubah perilaku. CGO_ENABLED=0 menjaga biner tetap statis dan portabel.
 build:
-	go build -o $(BINARY) .
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $(BINARY) .
 
 run: build
 	./$(BINARY)

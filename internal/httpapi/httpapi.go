@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -393,6 +394,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cfg)
 }
 
+// ssePollInterval adalah jeda antar pemeriksaan status perangkat di handler
+// SSE. Dibiarkan sebagai variabel agar pengujian dapat memperpendeknya.
+var ssePollInterval = 2 * time.Second
+
 // handleEvents mengalirkan perubahan job dan status perangkat sebagai SSE.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
@@ -407,18 +412,35 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	jobs, unsubscribe := s.Queue.Subscribe()
 	defer unsubscribe()
 
-	sendState := func() {
-		payload, err := json.Marshal(map[string]any{"device": s.Device.Current()})
+	lastWrite := time.Now()
+	var last device.Status
+	haveLast := false
+	sendState := func(force bool) {
+		cur := s.Device.Current()
+		// Jangan kirim bingkai yang identik dengan sebelumnya: klien tidak
+		// mendapat informasi baru, sementara ia akan membangun ulang tabelnya.
+		// force dipakai untuk bingkai pembuka agar klien selalu punya status.
+		if !force && haveLast && reflect.DeepEqual(last, cur) {
+			return
+		}
+		last = cur
+		haveLast = true
+		payload, err := json.Marshal(map[string]any{"device": cur})
 		if err != nil {
 			return
 		}
 		fmt.Fprintf(w, "event: state\ndata: %s\n\n", payload)
 		flusher.Flush()
+		lastWrite = time.Now()
 	}
-	sendState()
+	sendState(true)
 
-	deviceTicker := time.NewTicker(2 * time.Second)
+	deviceTicker := time.NewTicker(ssePollInterval)
 	defer deviceTicker.Stop()
+	// Komentar SSE berkala menjaga koneksi tetap hidup tanpa membangunkan
+	// logika render di klien (EventSource mengabaikan baris ": ").
+	keepalive := time.NewTicker(sseKeepalive)
+	defer keepalive.Stop()
 
 	for {
 		select {
@@ -434,8 +456,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			fmt.Fprintf(w, "event: job\ndata: %s\n\n", payload)
 			flusher.Flush()
+			lastWrite = time.Now()
 		case <-deviceTicker.C:
-			sendState()
+			sendState(false)
+		case <-keepalive.C:
+			if time.Since(lastWrite) >= sseKeepalive {
+				fmt.Fprint(w, ": keepalive\n\n")
+				flusher.Flush()
+				lastWrite = time.Now()
+			}
 		}
 	}
 }
+
+// sseKeepalive adalah jeda pengiriman komentar penjaga koneksi SSE.
+const sseKeepalive = 20 * time.Second

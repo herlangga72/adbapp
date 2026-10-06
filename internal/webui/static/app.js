@@ -28,6 +28,13 @@ const state = {
   selectedDevice: '',
 };
 
+// searchTimer menunda render daftar saat pengguna mengetik, sehingga tabel
+// tidak dibangun ulang pada setiap ketukan tombol.
+let searchTimer = null;
+// eventSource menyimpan koneksi SSE aktif agar tidak menumpuk koneksi baru saat
+// terjadi galat koneksi.
+let eventSource = null;
+
 function toast(message, isError) {
   const el = $('toast');
   el.textContent = message;
@@ -85,6 +92,7 @@ function updateActionButtons() {
 }
 
 function renderDevice(status) {
+  const wasReady = state.deviceReady;
   state.deviceReady = status.state === 'ready';
   const dot = $('dot');
   dot.className = 'dot ' + status.state;
@@ -110,8 +118,14 @@ function renderDevice(status) {
   }
   updateActionButtons();
   renderDevicePicker(status);
-  renderApks();
-  renderPackages();
+  // Tabel hanya dibangun ulang saat kesiapan perangkat berubah, sebab baris
+  // tabel memakai deviceReady() untuk mengaktifkan tombolnya. Peristiwa SSE
+  // dikirim setiap beberapa detik; membangun ulang ratusan baris tiap kali
+  // hanya membuang CPU dan membuat gulir/ketikan terasa tersendat.
+  if (wasReady !== state.deviceReady) {
+    renderApks();
+    renderPackages();
+  }
 }
 
 // renderDevicePicker menampilkan pemilih perangkat kecil saat lebih dari satu
@@ -155,7 +169,10 @@ function renderApks() {
     if (apk.error) tr.title = apk.error;
     tr.querySelector('input').addEventListener('change', (e) => {
       if (e.target.checked) state.selectedApks.add(apk.path); else state.selectedApks.delete(apk.path);
-      renderApks();
+      // Cukup perbarui baris dan hitungan; tidak perlu membangun ulang tabel.
+      tr.classList.toggle('selected', e.target.checked);
+      $('install-selected').textContent = `Pasang terpilih (${state.selectedApks.size})`;
+      updateActionButtons();
     });
     tbody.appendChild(tr);
   });
@@ -224,7 +241,11 @@ function renderPackages() {
       </td>`;
     tr.querySelector('input').addEventListener('change', (e) => {
       if (e.target.checked) state.selectedPkgs.add(pkg.name); else state.selectedPkgs.delete(pkg.name);
-      renderPackages();
+      // Perbarui hitungan tombol saja; membangun ulang tabel akan membuang
+      // posisi gulir dan membuat daftar panjang tersendat.
+      $('uninstall-selected').textContent = `Copot terpilih (${state.selectedPkgs.size})`;
+      $('uninstall-keep-selected').textContent = `Copot (simpan data) (${state.selectedPkgs.size})`;
+      updateActionButtons();
     });
     tr.querySelector('[data-act=detail]').addEventListener('click', () => showDetail(pkg.name));
     tr.querySelector('[data-act=uninstall]').addEventListener('click', () => {
@@ -411,7 +432,11 @@ async function loadPackages() {
 }
 
 function connectEvents() {
+  // Tutup koneksi lama sebelum membuat yang baru supaya koneksi tidak menumpuk
+  // ketika handler galat dipanggil berkali-kali.
+  if (eventSource) eventSource.close();
   const source = new EventSource('/api/events');
+  eventSource = source;
   source.addEventListener('state', (ev) => renderDevice(JSON.parse(ev.data).device));
   source.addEventListener('job', (ev) => {
     const job = JSON.parse(ev.data);
@@ -422,7 +447,14 @@ function connectEvents() {
       if (job.kind !== 'install') loadPackages();
     }
   });
-  source.onerror = () => setTimeout(connectEvents, 3000);
+  source.onerror = () => {
+    // EventSource menyambung ulang sendiri selama koneksi belum tertutup
+    // permanen. Panggil ulang hanya bila benar-benar CLOSED, agar tidak ada
+    // dua koneksi aktif ke server yang sama.
+    if (source.readyState === EventSource.CLOSED && eventSource === source) {
+      setTimeout(connectEvents, 3000);
+    }
+  };
 }
 
 function setupDropZone() {
@@ -536,7 +568,10 @@ function bind() {
       loadPackages();
     });
   });
-  $('search').addEventListener('input', renderPackages);
+  $('search').addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderPackages, 120);
+  });
   $('sort').addEventListener('change', renderPackages);
   $('history-filter').addEventListener('input', renderHistory);
   $('export-csv').addEventListener('click', () => { window.location = '/api/history/export?format=csv'; });
