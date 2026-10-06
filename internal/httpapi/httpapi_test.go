@@ -415,6 +415,49 @@ func TestListAPKsParallelKeepsOrderAndEntries(t *testing.T) {
 	}
 }
 
+// TestListAPKsParallelKeepsErrorEntries memastikan berkas .apk rusak tetap
+// muncul sebagai satu entri berisi error, bukan menggagalkan seluruh respons
+// atau mengubah urutan entri yang sah.
+func TestListAPKsParallelKeepsErrorEntries(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	folder := t.TempDir()
+	good, err := os.ReadFile(buildAPK(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "bagus.apk"), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "rusak.apk"), []byte("bukan apk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, localRequest(http.MethodGet, "/api/apks?folder="+folder, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kode %d body %s", rec.Code, rec.Body.String())
+	}
+	var entries []apkEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("harus 2 entri, dapat %d: %+v", len(entries), entries)
+	}
+	if entries[0].Name != "bagus.apk" || entries[1].Name != "rusak.apk" {
+		t.Fatalf("urutan salah: %q, %q", entries[0].Name, entries[1].Name)
+	}
+	if entries[0].Package == "" || entries[0].Error != "" {
+		t.Fatalf("entri sah tidak lengkap: %+v", entries[0])
+	}
+	if entries[1].Error == "" || entries[1].Package != "" {
+		t.Fatalf("entri rusak seharusnya berisi error saja: %+v", entries[1])
+	}
+}
+
 func TestSelectDeviceHappyPath(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.Device.(*fakeDevice).status.Others = []string{"S2"}
@@ -801,6 +844,51 @@ func TestFromURLDoesNotDestroyExistingAPK(t *testing.T) {
 	}
 	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
 		t.Fatalf("sisa berkas .part tidak dibersihkan: %v", err)
+	}
+}
+
+// TestFromURLSuccessReusesParsedMetadata memastikan jalur unduhan yang berhasil
+// mengembalikan entri yang menunjuk berkas final (bukan .part) dan sudah memuat
+// identitas APK hasil penguraian, tanpa membaca ulang berkas.
+func TestFromURLSuccessReusesParsedMetadata(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.Paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	apk, err := os.ReadFile(buildAPK(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(apk)
+	}))
+	defer upstream.Close()
+
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"url":%q,"name":"sukses.apk"}`, upstream.URL)
+	req := localRequest(http.MethodPost, "/api/apks/url", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("harus 200, dapat %d body %s", rec.Code, rec.Body.String())
+	}
+
+	var entry apkEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
+		t.Fatalf("JSON tidak sah: %v", err)
+	}
+	dest := filepath.Join(s.Paths.UploadsDir, "sukses.apk")
+	if entry.Path != dest || entry.Name != "sukses.apk" {
+		t.Fatalf("entri menunjuk berkas salah: %+v (mau %s)", entry, dest)
+	}
+	if entry.Package == "" || entry.Error != "" {
+		t.Fatalf("identitas APK tidak diisi: %+v", entry)
+	}
+	if _, err := os.Stat(dest); err != nil {
+		t.Fatalf("berkas final tidak ada: %v", err)
+	}
+	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
+		t.Fatalf("sisa .part tidak dibersihkan: %v", err)
 	}
 }
 
